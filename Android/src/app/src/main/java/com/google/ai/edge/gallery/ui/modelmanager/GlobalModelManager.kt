@@ -120,6 +120,7 @@ fun GlobalModelManager(
   startImport: Boolean = false,
   importUrl: String? = null,
   importIsImageGen: Boolean = false,
+  initialImportUrl: String? = null,
 ) {
   val uiState by viewModel.uiState.collectAsState()
   val builtInModels = remember { mutableStateListOf<Model>() }
@@ -215,6 +216,46 @@ fun GlobalModelManager(
       processModelUri(uri, /* isWebImport= */ true)
     }
   }
+  val handleImportUrl: (String) -> Unit =
+    remember(context, viewModel) {
+      { rawUrl: String ->
+        val url = rawUrl.trim()
+        if (url.isNotEmpty()) {
+          showHuggingFaceUrlDialog = false
+          val urlInfo = extractHfUrlInfo(url)
+          val targetModelId = urlInfo.modelId
+          when {
+            urlInfo.isDirectModelFile -> {
+              val fileUri =
+                if (targetModelId != null && urlInfo.fileName != null) {
+                  "https://huggingface.co/${targetModelId}/resolve/main/${urlInfo.fileName}?download=true"
+                    .toUri()
+                } else {
+                  url.toUri()
+                }
+              processModelUri(fileUri, /* isWebImport= */ true)
+            }
+            targetModelId != null -> {
+              isLoadingModelCardDetails = true
+              viewModel.fetchModelDetails(targetModelId) { detailedModel ->
+                isLoadingModelCardDetails = false
+                if (detailedModel != null) {
+                  selectedModelForDetails = detailedModel
+                  showModelDetailsSheet = true
+                } else {
+                  unsupportedModelErrorMessage =
+                    getErrorMessage(context, R.string.could_not_fetch_model_details, targetModelId)
+                  showUnsupportedModelDialog = true
+                }
+              }
+            }
+            else -> {
+              processModelUri(url.toUri(), /* isWebImport= */ true)
+            }
+          }
+        }
+      }
+    }
 
   val filePickerLauncher: ActivityResultLauncher<Intent> =
     rememberLauncherForActivityResult(
@@ -680,49 +721,7 @@ fun GlobalModelManager(
       urlInput = huggingFaceUrlInput,
       onUrlInputChange = { huggingFaceUrlInput = it },
       onDismiss = { showHuggingFaceUrlDialog = false },
-      onConfirm = {
-        val url = huggingFaceUrlInput.trim()
-        if (url.isNotEmpty()) {
-          showHuggingFaceUrlDialog = false
-          val urlInfo = extractHfUrlInfo(url)
-          when {
-            urlInfo.isDirectModelFile -> {
-              val fileUri =
-                if (urlInfo.modelId != null && urlInfo.fileName != null) {
-                  "https://huggingface.co/${urlInfo.modelId}/resolve/main/${urlInfo.fileName}?download=true"
-                    .toUri()
-                } else {
-                  url.toUri()
-                }
-              processModelUri(fileUri, true)
-            }
-            urlInfo.modelId != null -> {
-              val targetModelId = urlInfo.modelId
-              if (targetModelId != null) {
-                isLoadingModelCardDetails = true
-                viewModel.fetchModelDetails(targetModelId) { detailedModel ->
-                  isLoadingModelCardDetails = false
-                  if (detailedModel != null) {
-                    selectedModelForDetails = detailedModel
-                    showModelDetailsSheet = true
-                  } else {
-                    unsupportedModelErrorMessage =
-                      getErrorMessage(
-                        context,
-                        R.string.could_not_fetch_model_details,
-                        targetModelId,
-                      )
-                    showUnsupportedModelDialog = true
-                  }
-                }
-              }
-            }
-            else -> {
-              processModelUri(url.toUri(), true)
-            }
-          }
-        }
-      },
+      onConfirm = { handleImportUrl(huggingFaceUrlInput) },
     )
   }
 

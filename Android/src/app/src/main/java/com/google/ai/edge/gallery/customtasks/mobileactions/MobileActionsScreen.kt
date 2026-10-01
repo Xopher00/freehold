@@ -354,6 +354,8 @@ fun MainUi(
 ) {
   val modelManagerUiState by modelManagerViewModel.uiState.collectAsState()
   val model = selectedModel
+  val initStatus by model.initStatusFlow.collectAsState()
+  val isModelInitialized = initStatus is Model.InitializationStatus.Initialized
   val initialModelConfigValues = remember { model.configValues }
   val holdToDictateUiState by holdToDictateViewModel.uiState.collectAsState()
   val uiState by viewModel.uiState.collectAsState()
@@ -373,7 +375,7 @@ fun MainUi(
   val curDownloadStatus = modelManagerUiState.modelDownloadStatus[model.name]?.status
   setAppBarControlsDisabled(
     curDownloadStatus == ModelDownloadStatusType.SUCCEEDED &&
-      (!modelManagerUiState.isModelInitialized(model = model) || uiState.processing)
+      (!isModelInitialized || uiState.processing)
   )
 
   // Reset states on config changes.
@@ -388,7 +390,7 @@ fun MainUi(
   DisposableEffect(Unit) { onDispose { viewModel.cleanUp() } }
 
   // Show a loading indicator before the model is initialized.
-  if (!modelManagerUiState.isModelInitialized(model = model)) {
+  if (!isModelInitialized) {
     Row(
       modifier = Modifier.fillMaxSize(),
       verticalAlignment = Alignment.CenterVertically,
@@ -429,12 +431,15 @@ fun MainUi(
             val errors = mutableListOf<String>()
             for (action in curActions) {
               val curError = viewModel.performAction(action = action, context = context)
-              if (curError.isEmpty()) {
-                viewModel.addFunctionCallDetails(
-                  details = genFormattedFunctionCall(action = action, resources = resources)
-                )
-              } else {
+              // Always show the recognized function call, even if executing it failed, so users
+              // can see what the model attempted.
+              viewModel.addFunctionCallDetails(
+                details =
+                  genFormattedFunctionCall(action = action, resources = resources, error = curError)
+              )
+              if (curError.isNotEmpty()) {
                 errors.add(curError)
+                viewModel.addActionError(error = curError)
               }
             }
             if (errors.isNotEmpty()) {
@@ -650,6 +655,20 @@ fun MainUi(
                         )
                       )
                     }
+
+                    // The model response is generated before the action is executed, so it may
+                    // claim success even if the action failed. Flag the failure explicitly.
+                    if (uiState.actionErrors.isNotEmpty()) {
+                      MessageBodyWarning(
+                        ChatMessageWarning(
+                          content =
+                            stringResource(
+                              R.string.mobile_actions_warning_action_failed,
+                              uiState.actionErrors.joinToString(separator = "; "),
+                            )
+                        )
+                      )
+                    }
                   }
                 }
                 // Function called.
@@ -793,7 +812,11 @@ fun MainUi(
   }
 }
 
-private fun genFormattedFunctionCall(action: Action, resources: Resources): String {
+/**
+ * Formats [action]'s function call as markdown for the "Function(s) called" tab. If [error] is not
+ * empty, the call is annotated as failed with that error.
+ */
+private fun genFormattedFunctionCall(action: Action, resources: Resources, error: String): String {
   val strFunctionName = action.functionCallDetails.functionName
   val functionNameLabel = resources.getString(R.string.function_name)
   var content = "**$functionNameLabel**:\n- $strFunctionName"
@@ -803,6 +826,9 @@ private fun genFormattedFunctionCall(action: Action, resources: Resources): Stri
     val strParameters =
       action.functionCallDetails.parameters.joinToString("\n") { "- ${it.first}: \"${it.second}\"" }
     content += "\n\n**$parametersLabel**:\n$strParameters"
+  }
+  if (error.isNotEmpty()) {
+    content += "\n\n**${resources.getString(R.string.mobile_actions_function_call_failed, error)}**"
   }
   return content
 }

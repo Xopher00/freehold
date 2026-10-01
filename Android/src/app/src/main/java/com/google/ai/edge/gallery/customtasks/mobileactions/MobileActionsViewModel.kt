@@ -53,6 +53,8 @@ data class MobileActionsUiState(
   val modelResponse: String = "",
   val functionCallDetails: List<String> = listOf(),
   val noFunctionRecognized: Boolean = false,
+  // Errors from actions that were recognized but failed to execute on the device.
+  val actionErrors: List<String> = listOf(),
 )
 
 @HiltViewModel
@@ -72,6 +74,7 @@ constructor(@ApplicationContext private val appContext: Context) : ViewModel() {
     setModelResponse(response = "")
     setNoFunctionRecognized(value = false)
     clearFunctionCallDetails()
+    clearActionErrors()
   }
 
   fun cleanUp() {
@@ -114,6 +117,14 @@ constructor(@ApplicationContext private val appContext: Context) : ViewModel() {
     _uiState.update { _uiState.value.copy(noFunctionRecognized = value) }
   }
 
+  fun addActionError(error: String) {
+    _uiState.update { it.copy(actionErrors = it.actionErrors + error) }
+  }
+
+  fun clearActionErrors() {
+    _uiState.update { it.copy(actionErrors = listOf()) }
+  }
+
   fun processUserPrompt(
     model: Model,
     userPrompt: String,
@@ -135,6 +146,7 @@ constructor(@ApplicationContext private val appContext: Context) : ViewModel() {
       setModelResponse(response = "")
       setNoFunctionRecognized(value = false)
       clearFunctionCallDetails()
+      clearActionErrors()
 
       // Set user prompt.
       setUserPrompt(prompt = userPrompt)

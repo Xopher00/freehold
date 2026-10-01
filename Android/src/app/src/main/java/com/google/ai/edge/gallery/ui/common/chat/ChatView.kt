@@ -80,6 +80,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.google.ai.edge.gallery.R
 import com.google.ai.edge.gallery.data.BuiltInTaskId
+import com.google.ai.edge.gallery.data.Config
 import com.google.ai.edge.gallery.data.ConfigKeys
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.data.ModelDownloadStatusType
@@ -307,6 +308,12 @@ fun ChatView(
               modelPreparing = uiState.preparing,
               shouldShowHistoryButton = true,
               onConfigChanged = { old, new ->
+                if (Config.isContextCompactEnabled()) {
+                  val newAutoCompact = new[ConfigKeys.ENABLE_AUTO_CONTEXT_COMPACT.label] as? Boolean
+                  if (newAutoCompact != null) {
+                    viewModel.setAutoCompact(selectedModel, newAutoCompact)
+                  }
+                }
                 // Filter out config values that are not relevant to the task.
                 //
                 // - The "reset conversation turn count" is only valid for tiny garden task.
@@ -395,6 +402,7 @@ fun ChatView(
                       showImagePicker = showImagePicker,
                       showAudioPicker = showAudioPicker,
                       emptyStateComposable = emptyStateComposable,
+                      onNewChatClicked = onNewChatClicked,
                     )
                   // Model download
                   false ->

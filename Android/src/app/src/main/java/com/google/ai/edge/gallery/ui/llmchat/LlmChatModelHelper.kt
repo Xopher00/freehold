@@ -43,6 +43,7 @@ import com.google.ai.edge.gallery.relay.runtime.TokenCount
 import com.google.ai.edge.gallery.relay.runtime.TurnTokenUsage
 import com.google.ai.edge.gallery.relay.runtime.TurnUsageStore
 import com.google.ai.edge.gallery.runtime.CleanUpListener
+import com.google.ai.edge.gallery.runtime.LlmConversationInstance
 import com.google.ai.edge.gallery.runtime.LlmModelHelper
 import com.google.ai.edge.gallery.runtime.ResultListener
 import com.google.ai.edge.gallery.runtime.StructuredOutputRequest
@@ -84,7 +85,12 @@ data class LlmModelInstance(
   val engine: Engine,
   var conversation: Conversation,
   val metricsTracker: MetricsTracker? = null,
-)
+) : LlmConversationInstance {
+  override fun getTokenCount(): Int =
+  0
+
+  override fun sendMessage(prompt: String): Message = conversation.sendMessage(prompt)
+}
 
 object LlmChatModelHelper : LlmModelHelper {
   // Indexed by model name.
@@ -252,8 +258,11 @@ object LlmChatModelHelper : LlmModelHelper {
       Log.d(TAG, "Resetting conversation for model '${model.name}'")
 
       val instance = model.instance as LlmModelInstance? ?: return
-      instance.conversation.close()
-
+      try {
+        instance.conversation.close()
+      } catch (e: Exception) {
+        Log.w(TAG, "Failed to close previous conversation: ${e.message}", e)
+      }
       val engine = instance.engine
       val maxTokens =
         model.getIntConfigValue(key = ConfigKeys.MAX_TOKENS, defaultValue = DEFAULT_MAX_TOKEN)

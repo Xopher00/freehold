@@ -39,7 +39,7 @@ android {
     applicationId = "io.github.xopher00.freehold"
     minSdk = 31
     targetSdk = 37
-    versionCode = 44
+    versionCode = 45
     versionName = "1.0.20"
 
     // Needed for HuggingFace auth workflows.

@@ -157,14 +157,6 @@ data class ModelManagerUiState(
   /** A map that tracks the download status of optional extra data files, indexed by model name. */
   val extraDataDownloadStatus: Map<String, ModelDownloadStatus> = mapOf(),
 ) {
-  fun isModelInitialized(model: Model): Boolean {
-    return model.initStatusFlow.value is Model.InitializationStatus.Initialized
-  }
-
-  fun isModelInitializing(model: Model): Boolean {
-    return model.initializing
-  }
-
   fun isDownloadOptionalComponentsEnabled(modelName: String): Boolean {
     return downloadOptionalComponents[modelName] ?: true
   }
@@ -221,7 +213,7 @@ constructor(
   protected val _uiState = MutableStateFlow(createEmptyUiState())
   open val uiState = _uiState.asStateFlow()
 
-  fun fetchModelDetails(modelId: String, onResult: (HfModelItemProto?) -> Unit) {
+  open fun fetchModelDetails(modelId: String, onResult: (HfModelItemProto?) -> Unit) {
     viewModelScope.launch {
       try {
         val token = getTokenStatusAndData().data?.accessToken

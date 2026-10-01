@@ -179,6 +179,7 @@ fun MessageInputText(
   showImagePicker: Boolean = false,
   showAudioPicker: Boolean = false,
   showStopButtonWhenInProgress: Boolean = false,
+  isContextLimitReached: Boolean = false,
   onImageLimitExceeded: () -> Unit = {},
   onImagesIgnored: () -> Unit = {},
   onModelNotSupportImage: () -> Unit = {},
@@ -395,6 +396,7 @@ fun MessageInputText(
                   minLines = 1,
                   maxLines = 3,
                   onValueChange = onValueChanged,
+                  enabled = !isResettingSession && !modelInitializing,
                   colors =
                     TextFieldDefaults.colors(
                       unfocusedContainerColor = Color.Transparent,
@@ -751,6 +753,7 @@ fun MessageInputText(
                     enabled =
                       !inProgress &&
                         !isResettingSession &&
+                        !isContextLimitReached &&
                         (curMessage.isNotEmpty() ||
                           pickedAudioClips.isNotEmpty() ||
                           documentAttachment.pending != null),

@@ -233,6 +233,9 @@
   <string name="warning_no_function_call" translatable="true" description="Fallback response text when the agent model fails to map the user input to a function call or action. [CHAR_LIMIT=135]">I could not quite understand that. Could you try again with more specific details?</string>
   <string name="snackbar_no_function_call" translatable="true" description="Short message shown in a toast/snackbar when the user command didn't trigger any function. [CHAR_LIMIT=45]">No function recognized</string>
   <string name="unknown_error" translatable="true" description="Generic fallback error message text when a more specific error message is not available. [CHAR_LIMIT=22]">Unknown error</string>
+  <string name="mobile_actions_error_no_app_found" translatable="true" description="Error shown in Mobile Actions when no installed app can handle the requested action (e.g. no calendar app is installed to create an event). [CHAR_LIMIT=60]">No app on this device can handle this action</string>
+  <string name="mobile_actions_function_call_failed" translatable="true" description="Line shown under a function call in the Mobile Actions 'Function(s) called' tab when executing that function failed. %1$s is the error message. [CHAR_LIMIT=NONE]">Failed: %1$s</string>
+  <string name="mobile_actions_warning_action_failed" translatable="true" description="Warning shown below the model response in Mobile Actions when the requested action could not be performed on the device, so the model response may not reflect what actually happened. %1$s is the error message. [CHAR_LIMIT=NONE]">The action could not be completed: %1$s</string>
   <string name="view" translatable="true" description="General action label to view details of an item (e.g., tool or skill). [CHAR_LIMIT=18]">View</string>
   <string name="view_in_full_screen" translatable="true" description="Action chip label to expand a web view content into full screen modal. [CHAR_LIMIT=30]">View in full screen</string>
   <string name="snackbar_save_to_album_success" translatable="true" description="Success notification message shown when an image is saved to the gallery. [CHAR_LIMIT=45]">Saved to photo album</string>
@@ -786,6 +789,10 @@
   <string name="config_label_enable_thinking" translatable="false">Enable thinking</string>
   <!-- Label for the 'Enable speculative decoding' option in the model configuration dialog. -->
   <string name="config_label_enable_speculative_decoding" translatable="false">Enable speculative decoding</string>
+  <!-- Label for the 'Enable context compression' option in the model configuration dialog. -->
+  <string name="config_label_enable_context_compression" translatable="true" description="This string appears as a switch label in the model configuration dialog, allowing the user to toggle automatic conversation context compression when approaching the token limit. [CHAR_LIMIT=45]">Automatically compress context</string>
+  <!-- Description for the 'Automatically compress context' option in the model configuration dialog. -->
+  <string name="config_desc_enable_context_compression" translatable="true" description="This string appears as helper text below the 'Automatically compress context' switch in the model configuration dialog, explaining that the chat context will be automatically compressed when approaching the token limit. [CHAR_LIMIT=160]">When a chat approaches the token limit, automatically compress the chat context so I can keep chatting.</string>
   <!-- Label for the 'Max result count' option in the model configuration dialog. -->
   <string name="config_label_max_result_count" translatable="false">Max result count</string>
   <!-- Label for the 'Use GPU' option in the model configuration dialog. -->
@@ -1029,4 +1036,12 @@
   <string name="discovery_model_card_expand" translatable="true" description="Content description for the icon button that expands a Discovery result row to show the model's details. [CHAR_LIMIT=40]">Show details</string>
   <string name="discovery_model_card_collapse" translatable="true" description="Content description for the icon button that collapses a Discovery result row's expanded model details. [CHAR_LIMIT=40]">Hide details</string>
 
+  <!-- Context Compaction / Token Limit Banner strings -->
+  <string name="token_limit_reached_message" translatable="true" description="This string appears within the chat panel above the input box as an informational card banner when the model reaches its token limit. It explains that the token limit has been reached and tells the user they can compress context or start a new chat. [CHAR_LIMIT=200]">You are approaching the token limit for this chat. You can &lt;b&gt;compress context and continue this chat&lt;/b&gt; or start a &lt;b&gt;new chat&lt;/b&gt;.</string>
+  <string name="compress_and_continue_button" translatable="true" description="This string appears within the token limit banner as a button label. When tapped, it triggers conversation context compression and allows the user to continue chatting. [CHAR_LIMIT=30]">Compress and continue</string>
+  <string name="new_chat_button" translatable="true" description="This string appears within the token limit banner as a button label. When tapped, it starts a new chat session with cleared history. [CHAR_LIMIT=20]">New chat</string>
+  <string name="compressing_context" translatable="true" description="This string appears within the chat banner alongside a loading spinner while the conversation context is being summarized and compressed. [CHAR_LIMIT=70]">Token limit approaching. Compressing context…</string>
+  <string name="context_compressed_success" translatable="true" description="This string appears within the chat banner as a confirmation message indicating that conversation context compression completed successfully. [CHAR_LIMIT=70]">Context compressed! You may continue chatting.</string>
+  <string name="token_limit_default_behavior_checkbox" translatable="true" description="This string appears within the token limit banner as a checkbox label, allowing the user to remember this compression behavior for future sessions. [CHAR_LIMIT=80]">Default to this behavior next time I run out of context</string>
+  <string name="context_compaction_failed_message" translatable="true" description="This string appears in an error dialog when compressing the conversation context fails. [CHAR_LIMIT=120]">Failed to compress conversation context. Please try again.</string>
 </resources>

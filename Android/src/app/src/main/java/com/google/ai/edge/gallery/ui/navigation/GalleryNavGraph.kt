@@ -415,6 +415,7 @@ fun GalleryNavHost(
       GlobalModelManager(
         viewModel = modelManagerViewModel,
         tosViewModel = tosViewModel,
+        initialImportUrl = importUrl,
         navigateUp = {
           enableHomeScreenAnimation = false
           navController.navigateUp()
@@ -488,8 +489,10 @@ fun GalleryNavHost(
       } else {
         Log.e(TAG, "Malformed deep link URI received: $data")
       }
-    } else if (uriStr == "com.google.ai.edge.gallery://global_model_manager") {
-      navController.navigate(ROUTE_MODEL_MANAGER)
+    } else if (data.host == "global_model_manager" || data.host == "import") {
+      val route =
+          ROUTE_MODEL_MANAGER
+      navController.navigate(route)
     } else {
       // 2. Dynamic task-level deep links: com.google.ai.edge.gallery://<taskId>
       val host = data.host
