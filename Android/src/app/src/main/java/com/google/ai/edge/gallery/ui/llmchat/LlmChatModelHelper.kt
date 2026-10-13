@@ -16,7 +16,6 @@
 
 package com.google.ai.edge.gallery.ui.llmchat
 
-import com.google.ai.edge.litertlm.Capabilities
 import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
@@ -43,10 +42,10 @@ import com.google.ai.edge.gallery.relay.runtime.TokenCount
 import com.google.ai.edge.gallery.relay.runtime.TurnTokenUsage
 import com.google.ai.edge.gallery.relay.runtime.TurnUsageStore
 import com.google.ai.edge.gallery.runtime.CleanUpListener
+import com.google.ai.edge.gallery.relay.runtime.maxOutputTokensFrom
 import com.google.ai.edge.gallery.runtime.LlmConversationInstance
 import com.google.ai.edge.gallery.runtime.LlmModelHelper
 import com.google.ai.edge.gallery.runtime.ResultListener
-import com.google.ai.edge.gallery.runtime.StructuredOutputRequest
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Contents
@@ -58,6 +57,7 @@ import com.google.ai.edge.litertlm.ExperimentalApi
 import com.google.ai.edge.litertlm.ExperimentalFlags
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
+import com.google.ai.edge.litertlm.ModelInfo
 import com.google.ai.edge.litertlm.ResponseFormat
 import com.google.ai.edge.litertlm.SamplerConfig
 import com.google.ai.edge.litertlm.ToolProvider
@@ -86,8 +86,7 @@ data class LlmModelInstance(
   var conversation: Conversation,
   val metricsTracker: MetricsTracker? = null,
 ) : LlmConversationInstance {
-  override fun getTokenCount(): Int =
-  0
+  override fun getTokenCount(): Int = conversation.getTokenCount()
 
   override fun sendMessage(prompt: String): Message = conversation.sendMessage(prompt)
 }
@@ -110,7 +109,9 @@ object LlmChatModelHelper : LlmModelHelper {
     systemInstruction: Contents?,
     tools: List<ToolProvider>,
     enableConversationConstrainedDecoding: Boolean,
+    initialMessages: List<Message>,
     coroutineScope: CoroutineScope?,
+    enableResponseFormat: Boolean,
   ) {
     if (model.instance != null) {
       Log.d(TAG, "Model '${model.name}' already initialized in LlmChatModelHelper. Skipping.")
@@ -122,10 +123,6 @@ object LlmChatModelHelper : LlmModelHelper {
     // Prepare options.
     val maxTokens =
       model.getIntConfigValue(key = ConfigKeys.MAX_TOKENS, defaultValue = DEFAULT_MAX_TOKEN)
-    val topK = model.getIntConfigValue(key = ConfigKeys.TOPK, defaultValue = DEFAULT_TOPK)
-    val topP = model.getFloatConfigValue(key = ConfigKeys.TOPP, defaultValue = DEFAULT_TOPP)
-    val temperature =
-      model.getFloatConfigValue(key = ConfigKeys.TEMPERATURE, defaultValue = DEFAULT_TEMPERATURE)
     val visionBackend =
       when (model.currentVisionAccelerator) {
         Accelerator.CPU -> Backend.CPU()
@@ -160,10 +157,12 @@ object LlmChatModelHelper : LlmModelHelper {
       )
 
     var supportsSpeculativeDecoding = false
-    // Check if the model file supports speculative decoding.
+    // Check if the model file supports speculative decoding and visual token budget selection.
     try {
-      Capabilities(modelPath).use {
-        supportsSpeculativeDecoding = it.hasSpeculativeDecodingSupport()
+      ModelInfo.from(model.getPath(context)).use { modelInfo ->
+        if (modelInfo is ModelInfo.Llm) {
+          supportsSpeculativeDecoding = modelInfo.hasSpeculativeDecodingSupport()
+        }
       }
     } catch (e: Exception) {
       // Ignore exceptions and assume not supported.
@@ -196,42 +195,37 @@ object LlmChatModelHelper : LlmModelHelper {
       ExperimentalFlags.enableSpeculativeDecoding = speculativeDecoding
       Log.d(TAG, "Speculative decoding enabled: $speculativeDecoding")
       val engine = Engine(engineConfig)
-      engine.initialize()
-      ExperimentalFlags.enableSpeculativeDecoding = false
-      // Stays live past init: the conversation below and every later turn read it.
-      ExperimentalFlags.enableBenchmark = enableBenchmark
+      try {
+        engine.initialize()
+      } finally {
+        ExperimentalFlags.enableSpeculativeDecoding = false
+        // Stays live past init: the conversation below and every later turn read it.
+        ExperimentalFlags.enableBenchmark = enableBenchmark
+      }
 
-      ExperimentalFlags.enableConversationConstrainedDecoding =
-        enableConversationConstrainedDecoding
       val conversation =
-        engine.createConversation(
-          // A non-null responseFormat is dropped by the SDK when tools are set with automatic
-          // tool calling, for non-"tool" role messages.
-          ConversationConfig(
-            samplerConfig =
-              if (preferredBackend is Backend.NPU) {
-                null
-              } else {
-                SamplerConfig(
-                  topK = topK,
-                  topP = topP.toDouble(),
-                  temperature = temperature.toDouble(),
-                  seed = kotlin.random.Random.nextInt(),
-                )
-              },
+        try {
+          createConversation(
+            engine = engine,
+            model = model,
             systemInstruction = systemInstruction,
             tools = tools,
-            enableResponseFormat = true,
-            maxOutputToken = maxTokens,
+            enableConversationConstrainedDecoding = enableConversationConstrainedDecoding,
+            initialMessages = initialMessages,
           )
-        )
-      ExperimentalFlags.enableConversationConstrainedDecoding = false
-      model.instance =
+        } catch (e: Exception) {
+          try {
+            engine.close()
+          } catch (_: Exception) {}
+          throw e
+        }
+      model.markInitialized(
         LlmModelInstance(
           engine = engine,
           conversation = conversation,
           metricsTracker = metricsTracker,
         )
+      )
     } catch (e: Exception) {
       val errorMsg = cleanUpMediapipeTaskErrorMessage(e.message ?: "Unknown error")
       model.markInitializationFailed(errorMsg)
@@ -239,12 +233,10 @@ object LlmChatModelHelper : LlmModelHelper {
       onDone(errorMsg)
       return
     }
-    model.markInitialized()
     metricsTracker.onModelInitialized()
     onDone("")
   }
 
-  @OptIn(ExperimentalApi::class) // opt-in experimental flags
   override fun resetConversation(
     model: Model,
     supportImage: Boolean,
@@ -253,6 +245,7 @@ object LlmChatModelHelper : LlmModelHelper {
     tools: List<ToolProvider>,
     enableConversationConstrainedDecoding: Boolean,
     initialMessages: List<Message>,
+    enableResponseFormat: Boolean,
   ) {
     try {
       Log.d(TAG, "Resetting conversation for model '${model.name}'")
@@ -263,44 +256,20 @@ object LlmChatModelHelper : LlmModelHelper {
       } catch (e: Exception) {
         Log.w(TAG, "Failed to close previous conversation: ${e.message}", e)
       }
-      val engine = instance.engine
-      val maxTokens =
-        model.getIntConfigValue(key = ConfigKeys.MAX_TOKENS, defaultValue = DEFAULT_MAX_TOKEN)
-      val topK = model.getIntConfigValue(key = ConfigKeys.TOPK, defaultValue = DEFAULT_TOPK)
-      val topP = model.getFloatConfigValue(key = ConfigKeys.TOPP, defaultValue = DEFAULT_TOPP)
-      val temperature =
-        model.getFloatConfigValue(key = ConfigKeys.TEMPERATURE, defaultValue = DEFAULT_TEMPERATURE)
       val shouldEnableImage = supportImage
       val shouldEnableAudio = supportAudio
       Log.d(TAG, "Enable image: $shouldEnableImage, enable audio: $shouldEnableAudio")
+      Log.d(TAG, "Enable response format: $enableResponseFormat")
 
-      val accelerator = model.currentAccelerator ?: Accelerator.GPU
-      ExperimentalFlags.enableConversationConstrainedDecoding =
-        enableConversationConstrainedDecoding
       val newConversation =
-        engine.createConversation(
-          // A non-null responseFormat is dropped by the SDK when tools are set with automatic
-          // tool calling, for non-"tool" role messages.
-          ConversationConfig(
-            samplerConfig =
-              if (accelerator == Accelerator.NPU || accelerator == Accelerator.TPU) {
-                null
-              } else {
-                SamplerConfig(
-                  topK = topK,
-                  topP = topP.toDouble(),
-                  temperature = temperature.toDouble(),
-                  seed = kotlin.random.Random.nextInt(),
-                )
-              },
-            systemInstruction = systemInstruction,
-            tools = tools,
-            enableResponseFormat = true,
-            initialMessages = initialMessages,
-            maxOutputToken = maxTokens,
-          )
+        createConversation(
+          engine = instance.engine,
+          model = model,
+          systemInstruction = systemInstruction,
+          tools = tools,
+          enableConversationConstrainedDecoding = enableConversationConstrainedDecoding,
+          initialMessages = initialMessages,
         )
-      ExperimentalFlags.enableConversationConstrainedDecoding = false
       instance.conversation = newConversation
       // The replacement conversation starts on an empty KV cache, so per-session token accounting
       // and sensor histories are rewound to match. This also clears a turn left active by closing
@@ -313,6 +282,53 @@ object LlmChatModelHelper : LlmModelHelper {
     }
   }
 
+  @OptIn(ExperimentalApi::class) // opt-in experimental flags
+  private fun createConversation(
+    engine: Engine,
+    model: Model,
+    systemInstruction: Contents?,
+    tools: List<ToolProvider>,
+    enableConversationConstrainedDecoding: Boolean,
+    initialMessages: List<Message>,
+  ): Conversation {
+    val maxTokens =
+      model.getIntConfigValue(key = ConfigKeys.MAX_TOKENS, defaultValue = DEFAULT_MAX_TOKEN)
+    val topK = model.getIntConfigValue(key = ConfigKeys.TOPK, defaultValue = DEFAULT_TOPK)
+    val topP = model.getFloatConfigValue(key = ConfigKeys.TOPP, defaultValue = DEFAULT_TOPP)
+    val temperature =
+      model.getFloatConfigValue(key = ConfigKeys.TEMPERATURE, defaultValue = DEFAULT_TEMPERATURE)
+    val accelerator = model.currentAccelerator ?: Accelerator.GPU
+    val samplerConfig =
+      if (accelerator == Accelerator.NPU || accelerator == Accelerator.TPU) {
+        null
+      } else {
+        SamplerConfig(
+          topK = topK,
+          topP = topP.toDouble(),
+          temperature = temperature.toDouble(),
+          seed = kotlin.random.Random.nextInt(),
+        )
+      }
+    ExperimentalFlags.enableConversationConstrainedDecoding = enableConversationConstrainedDecoding
+    return try {
+      engine.createConversation(
+        // A non-null responseFormat is dropped by the SDK when tools are set with automatic
+        // tool calling, for non-"tool" role messages.
+        ConversationConfig(
+          samplerConfig = samplerConfig,
+          systemInstruction = systemInstruction,
+          tools = tools,
+          initialMessages = initialMessages,
+          enableResponseFormat = true,
+          maxOutputToken = maxTokens,
+        )
+      )
+    } finally {
+      ExperimentalFlags.enableConversationConstrainedDecoding = false
+    }
+  }
+
+  @OptIn(ExperimentalApi::class) // opt-in experimental flags
   override fun cleanUp(model: Model, onDone: () -> Unit) {
     if (model.instance == null) {
       onDone()
@@ -334,6 +350,7 @@ object LlmChatModelHelper : LlmModelHelper {
     }
 
     instance.metricsTracker?.resetSession()
+    instance.metricsTracker?.close()
 
     val onCleanUp = cleanUpListeners.remove(model.name)
     if (onCleanUp != null) {
@@ -348,9 +365,14 @@ object LlmChatModelHelper : LlmModelHelper {
   override fun stopResponse(model: Model) {
     val instance = model.instance as? LlmModelInstance ?: return
     try {
+      // Signal the native engine to cancel first. The engine's worker thread will finalize
+      // `TimeDecodeTurnEnd()` in `BenchmarkInfo` and then invoke
+      // `MessageCallback.onError(CancellationException)`, which calls `metricsTracker.cancelTurn()`
+      // at the exact point when engine benchmark and KV-cache token counts are ready.
       instance.conversation.cancelProcess()
-    } catch (e: IllegalStateException) {
-      Log.w(TAG, "Conversation is not alive, cannot cancel process", e)
+    } catch (e: Exception) {
+      Log.w(TAG, "Failed to cancel conversation process", e)
+      val unused = instance.metricsTracker?.cancelTurn()
     }
   }
 
@@ -364,11 +386,8 @@ object LlmChatModelHelper : LlmModelHelper {
     images: List<Bitmap>,
     audioClips: List<ByteArray>,
     coroutineScope: CoroutineScope?,
-    extraContext: Map<String, String>?,
-    sessionId: String?,
-    messageIndex: Int?,
-    maxOutputTokens: Int?,
-    responseFormat: StructuredOutputRequest?,
+    extraContext: Map<String, String>,
+    responseJsonSchema: String?,
   ) {
     val instance = model.instance as? LlmModelInstance
     if (instance == null) {
@@ -381,17 +400,10 @@ object LlmChatModelHelper : LlmModelHelper {
       cleanUpListeners[model.name] = cleanUpListener
     }
 
-    // Step 1: Initialize turn telemetry with active Conversation and caller-provided correlation
-    // IDs.
+    // Step 1: Start the turn before processing the input, so its latency includes the input
+    // processing the user waits for.
     val conversation = instance.conversation
-    instance.metricsTracker?.startTurn(
-      session = conversation.asSession(),
-      sessionId = sessionId,
-      // Since each turn consists of two back-and-forth messages, we divide the message index by
-      // 2 to get the turn index.
-      turnIndex = if (messageIndex == null) null else messageIndex / 2,
-    )
-
+    instance.metricsTracker?.startTurn(conversation.asSession())
     // Token accounting. getTokenCount() is cumulative over the conversation, so the difference
     // across this turn is exact even though the prompt/completion split below is not.
     val turnSequence = TurnUsageStore.begin(model.name)
@@ -441,11 +453,12 @@ object LlmChatModelHelper : LlmModelHelper {
       }
 
       // Step 3: Configure extra runtime parameters (such as thinking reasoning mode).
-      val enableThinking = extraContext?.get("enable_thinking") == "true"
-      val finalExtraContext: Map<String, Any> =
-        (extraContext ?: emptyMap()) + ("enable_thinking" to enableThinking)
+      val enableThinking = extraContext["enable_thinking"] == "true"
+      val finalExtraContext: Map<String, Any> = extraContext + ("enable_thinking" to enableThinking)
+      val maxOutputTokens =
+        maxOutputTokensFrom(extraContext)
 
-      val litertResponseFormat = responseFormat?.let { ResponseFormat.json(it.schemaJson) }
+      val litertResponseFormat = responseJsonSchema?.let { ResponseFormat.json(it) }
       // Step 4: Dispatch asynchronous streaming inference to the native LiteRT-LM engine.
       conversation.sendMessageAsync(
         contents = Contents.of(contents),
@@ -474,7 +487,8 @@ object LlmChatModelHelper : LlmModelHelper {
 
             override fun onError(throwable: Throwable) {
               if (throwable is CancellationException) {
-                // User or system cancelled inference: reconcile context tokens and mark CANCELLED.
+                // Native cancellation via cancelProcess() completed on the worker thread; finalize
+                // cancelled-turn metrics now that engine benchmark and token counts are ready.
                 Log.i(TAG, "The inference is cancelled.")
                 val unused = instance.metricsTracker?.cancelTurn()
                 recordUsage()
@@ -499,6 +513,12 @@ object LlmChatModelHelper : LlmModelHelper {
     } catch (e: Exception) {
       // sendMessageAsync can throw synchronously before any callback fires.
       TurnUsageStore.abort(model.name)
+      // No engine callback follows a failure before the message is sent, so end the turn here.
+      val unused =
+        instance.metricsTracker?.endTurn(
+          statusCode = InferenceStatus.Code.ERROR,
+          errorMessage = e.message ?: "Unknown error",
+        )
       throw e
     }
   }

@@ -23,11 +23,13 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.ai.edge.gallery.GalleryEvent
+import com.google.ai.edge.gallery.R
 import com.google.ai.edge.gallery.agent.AgentRuntimeExecutor
 import com.google.ai.edge.gallery.agent.sessions.LlmSessionManager
+import com.google.ai.edge.gallery.common.metrics.InferenceMetrics
 import com.google.ai.edge.gallery.common.processLlmResponse
 import com.google.ai.edge.gallery.data.Config
-import com.google.ai.edge.gallery.data.ConfigKeys
+import com.google.ai.edge.gallery.data.DataStoreRepository
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.firebaseAnalytics
 import com.google.ai.edge.gallery.proto.ChatSessionProto
@@ -48,7 +50,6 @@ enum class ContextCompactionStatus {
   IDLE,
   TOKEN_LIMIT_REACHED,
   COMPACTING,
-  COMPACTED,
 }
 
 /** Source that triggered context compaction. */
@@ -78,8 +79,8 @@ data class ChatUiState(
   /** A map of model names to their context compaction status. */
   val contextCompactionStatusByModel: Map<String, ContextCompactionStatus> = mapOf(),
 
-  /** A map of model names to whether auto-compaction is enabled by default in the thread. */
-  val autoCompactByModel: Map<String, Boolean> = mapOf(),
+  /** A map of task IDs to whether auto-compaction is enabled by default for that task. */
+  val autoCompactByTask: Map<String, Boolean> = mapOf(),
 
 )
 
@@ -88,10 +89,13 @@ data class ChatUiState(
  *
  * @property runtimeExecutor Optional [AgentRuntimeExecutor] to delegate inference.
  * @property llmSessionManager [LlmSessionManager] to delegate session management and persistence.
+ * @property dataStoreRepository Optional [DataStoreRepository] for reading and persisting
+ *   task-level settings.
  */
 abstract class ChatViewModel(
   open val runtimeExecutor: AgentRuntimeExecutor? = null,
   val llmSessionManager: LlmSessionManager,
+  open val dataStoreRepository: DataStoreRepository? = null,
 ) : ViewModel() {
   /** The identifier for the current active chat session. */
   open var currentSessionId: String
@@ -103,7 +107,16 @@ abstract class ChatViewModel(
     }
 
   private val _uiState = MutableStateFlow(createUiState())
-  val uiState = _uiState.asStateFlow()
+  val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
+
+  /** Real-time inference metrics stream for the currently observed model. */
+  open val liveMetrics: StateFlow<InferenceMetrics?> =
+    MutableStateFlow<InferenceMetrics?>(null).asStateFlow()
+
+  /**
+   * Attaches [liveMetrics] observation to the given [model] across its initialization lifecycle.
+   */
+  open fun observeLiveMetrics(model: Model) {}
 
   private var compactionJob: Job? = null
 
@@ -130,17 +143,28 @@ abstract class ChatViewModel(
         newMessages.removeAt(newMessages.size - 1)
       }
       newMessages.add(message)
-      val status = state.contextCompactionStatusByModel[model.name]
-      val newStatusMap =
-        if (status == ContextCompactionStatus.COMPACTED && message.side == ChatSide.USER) {
-          state.contextCompactionStatusByModel + (model.name to ContextCompactionStatus.IDLE)
-        } else {
-          state.contextCompactionStatusByModel
-        }
-      state.copy(
-        messagesByModel = newMessagesByModel,
-        contextCompactionStatusByModel = newStatusMap,
-      )
+      state.copy(messagesByModel = newMessagesByModel)
+    }
+  }
+
+  /**
+   * Inserts [message] immediately before the active turn's trailing loading and user messages for
+   * [model].
+   */
+  fun insertMessageBeforeCurrentTurn(model: Model, message: ChatMessage) {
+    _uiState.update { state ->
+      val newMessagesByModel = state.messagesByModel.toMutableMap()
+      val newMessages = newMessagesByModel[model.name]?.toMutableList() ?: mutableListOf()
+      newMessagesByModel[model.name] = newMessages
+      var insertIndex = newMessages.size
+      if (insertIndex > 0 && newMessages[insertIndex - 1] is ChatMessageLoading) {
+        insertIndex--
+      }
+      while (insertIndex > 0 && newMessages[insertIndex - 1].side == ChatSide.USER) {
+        insertIndex--
+      }
+      newMessages.add(insertIndex, message)
+      state.copy(messagesByModel = newMessagesByModel)
     }
   }
 
@@ -191,36 +215,68 @@ abstract class ChatViewModel(
   }
 
   /**
-   * Updates whether automatic context compaction is enabled for the given [model] in both the
-   * model's configuration values and the UI state.
+   * Updates whether automatic context compaction is enabled for the given [taskId] in both
+   * [DataStoreRepository] and the UI state.
    *
-   * @param model The model for which to update the auto-compaction setting.
+   * @param taskId The identifier of the task for which to update the auto-compaction setting.
    * @param enabled Whether automatic context compaction should be enabled.
    */
-  fun setAutoCompact(model: Model, enabled: Boolean) {
-    val newConfigValues = model.configValues.toMutableMap()
-    newConfigValues[ConfigKeys.ENABLE_AUTO_CONTEXT_COMPACT.label] = enabled
-    model.configValues = newConfigValues
+  fun setAutoCompact(taskId: String, enabled: Boolean) {
+    dataStoreRepository?.saveAutoContextCompact(taskId, enabled)
     _uiState.update { state ->
-      state.copy(autoCompactByModel = state.autoCompactByModel + (model.name to enabled))
+      state.copy(autoCompactByTask = state.autoCompactByTask + (taskId to enabled))
     }
   }
 
   /**
-   * Returns whether automatic context compaction is enabled for the given [model].
+   * Asynchronously loads the persisted automatic context compaction setting for [taskId] into the
+   * UI state if not already cached.
    *
-   * Checks the UI state override first, falling back to the model's
-   * [ConfigKeys.ENABLE_AUTO_CONTEXT_COMPACT] configuration value (`false` by default).
-   *
-   * @param model The model to check.
-   * @return `true` if automatic context compaction is enabled for [model], `false` otherwise.
+   * @param taskId The identifier of the task whose setting should be loaded.
    */
-  fun isAutoCompactEnabled(model: Model): Boolean {
-    return _uiState.value.autoCompactByModel[model.name]
-      ?: model.getBooleanConfigValue(
-        key = ConfigKeys.ENABLE_AUTO_CONTEXT_COMPACT,
-        defaultValue = false,
-      )
+  fun loadAutoCompact(taskId: String) {
+    if (taskId.isEmpty() || _uiState.value.autoCompactByTask.containsKey(taskId)) {
+      return
+    }
+    val repo = dataStoreRepository ?: return
+    viewModelScope.launch(Dispatchers.IO) {
+      if (_uiState.value.autoCompactByTask.containsKey(taskId)) {
+        return@launch
+      }
+      val enabled = repo.readAutoContextCompact(taskId)
+      _uiState.update { state ->
+        if (state.autoCompactByTask.containsKey(taskId)) {
+          state
+        } else {
+          state.copy(autoCompactByTask = state.autoCompactByTask + (taskId to enabled))
+        }
+      }
+    }
+  }
+
+  /**
+   * Returns whether automatic context compaction is enabled for the given [taskId].
+   *
+   * Checks the UI state cache first; if absent, reads the persisted setting from
+   * [DataStoreRepository] (`false` by default) and caches it in the UI state.
+   *
+   * @param taskId The identifier of the task to check.
+   * @return `true` if automatic context compaction is enabled for [taskId], `false` otherwise.
+   */
+  fun isAutoCompactEnabled(taskId: String): Boolean {
+    _uiState.value.autoCompactByTask[taskId]?.let {
+      return it
+    }
+    val repo = dataStoreRepository ?: return false
+    val enabled = repo.readAutoContextCompact(taskId)
+    _uiState.update { state ->
+      if (state.autoCompactByTask.containsKey(taskId)) {
+        state
+      } else {
+        state.copy(autoCompactByTask = state.autoCompactByTask + (taskId to enabled))
+      }
+    }
+    return _uiState.value.autoCompactByTask[taskId] ?: enabled
   }
 
   /**
@@ -266,7 +322,7 @@ abstract class ChatViewModel(
     model: Model,
     taskId: String = "",
     triggerType: ContextCompactionTriggerType =
-      if (isAutoCompactEnabled(model)) {
+      if (isAutoCompactEnabled(taskId)) {
         ContextCompactionTriggerType.AUTO
       } else {
         ContextCompactionTriggerType.MANUAL
@@ -294,7 +350,7 @@ abstract class ChatViewModel(
     model: Model,
     taskId: String = "",
     triggerType: ContextCompactionTriggerType =
-      if (isAutoCompactEnabled(model)) {
+      if (isAutoCompactEnabled(taskId)) {
         ContextCompactionTriggerType.AUTO
       } else {
         ContextCompactionTriggerType.MANUAL
@@ -349,7 +405,7 @@ abstract class ChatViewModel(
     onSuccess: () -> Unit,
     onError: () -> Unit,
   ) {
-    val defaultToBehavior = isAutoCompactEnabled(model)
+    val defaultToBehavior = isAutoCompactEnabled(taskId)
     Log.d(
       TAG,
       "Analytics: context_compression, capability_name=$taskId, model_id=${model.name}, model_version=${model.downloadInfo.version}, trigger_type=${triggerType.value}, default_to_behavior=$defaultToBehavior",
@@ -384,7 +440,11 @@ abstract class ChatViewModel(
       val success = llmSessionManager.compactContextIfNeeded(currentSessionId, model, force = true)
       if (success) {
         Log.d(TAG, "Context compacted for session $currentSessionId on model ${model.name}")
-        setContextCompactionStatus(model, ContextCompactionStatus.COMPACTED)
+        addMessage(
+          model = model,
+          message = ChatMessageDivider(textResId = R.string.context_compressed_success),
+        )
+        setContextCompactionStatus(model, ContextCompactionStatus.IDLE)
         onSuccess()
       } else {
         Log.d(
@@ -482,6 +542,7 @@ abstract class ChatViewModel(
             latencyMs = latencyMs,
             accelerator = lastMessage.accelerator,
             hideSenderLabel = lastMessage.hideSenderLabel,
+            id = lastMessage.id,
           )
         newMessages.removeAt(newMessages.size - 1)
         newMessages.add(newLastMessage)

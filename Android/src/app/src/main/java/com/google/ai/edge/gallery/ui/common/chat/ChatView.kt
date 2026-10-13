@@ -80,7 +80,6 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.google.ai.edge.gallery.R
 import com.google.ai.edge.gallery.data.BuiltInTaskId
-import com.google.ai.edge.gallery.data.Config
 import com.google.ai.edge.gallery.data.ConfigKeys
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.data.ModelDownloadStatusType
@@ -300,6 +299,8 @@ fun ChatView(
           modifier = modifier,
           snackbarHost = { SnackbarHost(snackbarHostState) },
           topBar = {
+            LaunchedEffect(task.id) { viewModel.loadAutoCompact(task.id) }
+            val isAutoCompactEnabled = uiState.autoCompactByTask[task.id] ?: false
             ModelPageAppBar(
               task = task,
               model = selectedModel,
@@ -307,11 +308,14 @@ fun ChatView(
               inProgress = uiState.inProgress,
               modelPreparing = uiState.preparing,
               shouldShowHistoryButton = true,
+              isAutoCompactEnabled = isAutoCompactEnabled,
               onConfigChanged = { old, new ->
-                if (Config.isContextCompactEnabled()) {
+                val isContextCompactSupported = task.isContextCompactSupported(selectedModel)
+                if (isContextCompactSupported) {
+                  val oldAutoCompact = old[ConfigKeys.ENABLE_AUTO_CONTEXT_COMPACT.label] as? Boolean
                   val newAutoCompact = new[ConfigKeys.ENABLE_AUTO_CONTEXT_COMPACT.label] as? Boolean
-                  if (newAutoCompact != null) {
-                    viewModel.setAutoCompact(selectedModel, newAutoCompact)
+                  if (newAutoCompact != null && newAutoCompact != oldAutoCompact) {
+                    viewModel.setAutoCompact(task.id, newAutoCompact)
                   }
                 }
                 // Filter out config values that are not relevant to the task.
@@ -322,6 +326,14 @@ fun ChatView(
                 if (task.id != BuiltInTaskId.LLM_TINY_GARDEN) {
                   filteredOld.remove(ConfigKeys.RESET_CONVERSATION_TURN_COUNT.label)
                   filteredNew.remove(ConfigKeys.RESET_CONVERSATION_TURN_COUNT.label)
+                }
+                if (!task.isVisionEnabled(selectedModel)) {
+                  filteredOld.remove(ConfigKeys.VISUAL_TOKEN_BUDGET.label)
+                  filteredNew.remove(ConfigKeys.VISUAL_TOKEN_BUDGET.label)
+                }
+                if (!isContextCompactSupported) {
+                  filteredOld.remove(ConfigKeys.ENABLE_AUTO_CONTEXT_COMPACT.label)
+                  filteredNew.remove(ConfigKeys.ENABLE_AUTO_CONTEXT_COMPACT.label)
                 }
                 viewModel.addConfigChangedMessage(
                   oldConfigValues = filteredOld,

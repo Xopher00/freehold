@@ -23,6 +23,7 @@ import android.graphics.Bitmap
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.relay.runtime.TurnUsageStore
 import com.google.ai.edge.gallery.relay.runtime.isContextOverflow
+import com.google.ai.edge.gallery.relay.runtime.maxOutputTokensExtraContext
 import com.google.ai.edge.gallery.runtime.LlmModelHelper
 import com.google.ai.edge.gallery.runtime.StructuredOutputRequest
 import com.google.ai.edge.gallery.runtime.runtimeHelper
@@ -83,9 +84,8 @@ internal suspend fun collectInferenceText(
         images = images,
         audioClips = emptyList(),
         coroutineScope = coroutineScope,
-        extraContext = null,
-        maxOutputTokens = maxOutputTokens,
-        responseFormat = responseFormat,
+        extraContext = maxOutputTokensExtraContext(maxOutputTokens),
+        responseJsonSchema = responseFormat?.schemaJson,
     )
 
     return completer.await()

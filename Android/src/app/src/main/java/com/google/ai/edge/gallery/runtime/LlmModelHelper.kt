@@ -30,6 +30,21 @@ typealias ResultListener =
 typealias CleanUpListener = () -> Unit
 
 /**
+ * Key in the `extraContext` of [LlmModelHelper.runInference] that caps the number of tokens
+ * generated for that call. The value is a positive integer string. It overrides the model's
+ * configured max output tokens for runtimes that support it, and is ignored by the others.
+ */
+const val EXTRA_CONTEXT_MAX_OUTPUT_TOKENS = "max_output_tokens"
+
+/**
+ * Key in the `extraContext` of [LlmModelHelper.runInference] that opts the call into a multi-turn
+ * vision session when set to "true". Runtimes that keep no conversation state of their own (e.g.
+ * AICore) then prepend the system instruction from the last initialize/reset call to the prompt and
+ * attach the most recent image to later text-only turns. Other runtimes ignore it.
+ */
+const val EXTRA_CONTEXT_MULTI_TURN_VISION_SESSION = "multi_turn_vision_session"
+
+/**
  * Abstraction over a model instance's active conversation for inspecting token usage and sending
  * synchronous messages (e.g., for context compaction).
  */
@@ -60,6 +75,7 @@ interface LlmModelHelper {
    * @param tools tools available for the model to use.
    * @param enableConversationConstrainedDecoding whether to enable constrained decoding for
    *   conversations.
+   * @param initialMessages messages used to seed initial conversation history on initialization.
    * @param coroutineScope optional coroutine scope for async execution.
    */
   fun initialize(
@@ -72,7 +88,9 @@ interface LlmModelHelper {
     systemInstruction: Contents? = null,
     tools: List<ToolProvider> = listOf(),
     enableConversationConstrainedDecoding: Boolean = false,
+    initialMessages: List<Message> = listOf(),
     coroutineScope: CoroutineScope? = null,
+    enableResponseFormat: Boolean = false,
   )
 
   /**
@@ -85,6 +103,10 @@ interface LlmModelHelper {
    * @param tools new or updated tools available for the model.
    * @param enableConversationConstrainedDecoding whether to enable constrained decoding.
    * @param initialMessages messages used to reinitialize conversation history on reset.
+   * @param enableResponseFormat whether the new conversation accepts a per-message response format
+   *   (`responseJsonSchema` in [runInference]). Unlike [enableConversationConstrainedDecoding],
+   *   which constrains tool calls, this constrains the whole reply. Runtimes without support ignore
+   *   it.
    */
   fun resetConversation(
     model: Model,
@@ -94,6 +116,7 @@ interface LlmModelHelper {
     tools: List<ToolProvider> = listOf(),
     enableConversationConstrainedDecoding: Boolean = false,
     initialMessages: List<Message> = listOf(),
+    enableResponseFormat: Boolean = false,
   )
 
   /**
@@ -116,13 +139,9 @@ interface LlmModelHelper {
    * @param audioClips optional list of audio clips provided as input context.
    * @param coroutineScope optional coroutine scope for async inference execution.
    * @param extraContext optional extra context for inference (e.g. "enable_thinking").
-   * @param sessionId optional conversation session identifier for telemetry correlation.
-   * @param messageIndex optional sequential message index within the conversation for telemetry
-   *   correlation.
-   * @param maxOutputTokens optional per-request cap on generated tokens; overrides the model's
-   *   configured MAX_OUTPUT_TOKENS when non-null.
-   * @param responseFormat an optional schema-constrained decoding request; honored by engines that
-   *   support it, ignored otherwise.
+   * @param responseJsonSchema optional JSON Schema that the whole reply must match (constrained
+   *   decoding). It only applies when the active conversation was reset with `enableResponseFormat
+   *   = true`, and runtimes without support ignore it.
    */
   fun runInference(
     model: Model,
@@ -133,11 +152,8 @@ interface LlmModelHelper {
     images: List<Bitmap> = listOf(),
     audioClips: List<ByteArray> = listOf(),
     coroutineScope: CoroutineScope? = null,
-    extraContext: Map<String, String>? = null,
-    sessionId: String? = null,
-    messageIndex: Int? = null,
-    maxOutputTokens: Int? = null,
-    responseFormat: StructuredOutputRequest? = null,
+    extraContext: Map<String, String> = emptyMap(),
+    responseJsonSchema: String? = null,
   )
 
   /**
@@ -146,4 +162,24 @@ interface LlmModelHelper {
    * @param model the ongoing model response to be stopped.
    */
   fun stopResponse(model: Model)
+
+  /**
+   * Counts the tokens in [text] using the model's tokenizer.
+   *
+   * @param model the initialized model whose tokenizer is used.
+   * @param text the raw text to count.
+   * @return the token count, or null if the runtime doesn't support counting or counting failed.
+   */
+  suspend fun countTokens(model: Model, text: String): Int? = null
+
+  /**
+   * Counts the tokens the model would prefill if [input] were passed to [runInference] now. Unlike
+   * [countTokens], this includes the current conversation history and any prompt template the
+   * runtime applies. Images and audio are not counted.
+   *
+   * @param model the initialized model whose conversation state and tokenizer are used.
+   * @param input the text input that would be passed to [runInference].
+   * @return the token count, or null if the runtime doesn't support counting or counting failed.
+   */
+  suspend fun countInputTokens(model: Model, input: String): Int? = null
 }

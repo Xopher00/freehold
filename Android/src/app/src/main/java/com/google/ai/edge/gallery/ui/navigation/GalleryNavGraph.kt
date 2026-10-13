@@ -75,11 +75,13 @@ import com.google.ai.edge.gallery.data.Task
 import com.google.ai.edge.gallery.data.isLegacyTasks
 import com.google.ai.edge.gallery.ui.benchmark.BenchmarkScreen
 import com.google.ai.edge.gallery.ui.common.ErrorDialog
+import com.google.ai.edge.gallery.ui.common.LocalTestAllowlistDialog
 import com.google.ai.edge.gallery.ui.common.ModelPageAppBar
 import com.google.ai.edge.gallery.ui.common.chat.ModelDownloadStatusInfoPanel
 import com.google.ai.edge.gallery.ui.common.tos.TosViewModel
 import com.google.ai.edge.gallery.ui.home.HomeScreen
 import com.google.ai.edge.gallery.ui.modelmanager.GlobalModelManager
+import com.google.ai.edge.gallery.ui.modelmanager.MODEL_ALLOWLIST_TEST_FILE_PATH
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManager
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManagerViewModel
 import com.google.ai.edge.gallery.ui.notifications.NotificationsScreen
@@ -150,7 +152,6 @@ fun GalleryNavHost(
   tosViewModel: TosViewModel = hiltViewModel(),
 ) {
   val lifecycleOwner = LocalLifecycleOwner.current
-  var showModelManager by remember { mutableStateOf(false) }
   var pickedTask by remember { mutableStateOf<Task?>(null) }
   var enableHomeScreenAnimation by remember { mutableStateOf(false) }
   var enableModelListAnimation by remember { mutableStateOf(true) }
@@ -325,10 +326,17 @@ fun GalleryNavHost(
             var disableAppBarControls by remember { mutableStateOf(false) }
             var hideTopBar by remember { mutableStateOf(false) }
             var customNavigateUpCallback by remember { mutableStateOf<(() -> Unit)?>(null) }
+            var customPromptProvider by remember { mutableStateOf<(() -> String)?>(null) }
+            var customOnPromptChanged by remember { mutableStateOf<((String) -> Unit)?>(null) }
+            var customHistoryClickHandler by remember { mutableStateOf<(() -> Unit)?>(null) }
+            var customDefaultPromptProvider by remember { mutableStateOf<(() -> String)?>(null) }
             CustomTaskScreen(
               task = customTask.task,
               initialModel = initialModel,
               modelManagerViewModel = modelManagerViewModel,
+              disableAppBarControls = disableAppBarControls,
+              hideTopBar = hideTopBar,
+              useThemeColor = customTask.task.useThemeColor,
               onNavigateUp = {
                 if (customNavigateUpCallback != null) {
                   customNavigateUpCallback?.invoke()
@@ -352,9 +360,13 @@ fun GalleryNavHost(
                   }
                 }
               },
-              disableAppBarControls = disableAppBarControls,
-              hideTopBar = hideTopBar,
-              useThemeColor = customTask.task.useThemeColor,
+              allowEditingSystemPrompt = customPromptProvider != null,
+              curSystemPrompt =
+                customPromptProvider?.invoke() ?: customTask.task.defaultSystemPrompt,
+              defaultSystemPrompt =
+                customDefaultPromptProvider?.invoke() ?: customTask.task.defaultSystemPrompt,
+              onSystemPromptChanged = { newPrompt -> customOnPromptChanged?.invoke(newPrompt) },
+              onHistoryClicked = customHistoryClickHandler,
             ) { bottomPadding, selectedModel ->
               customTask.MainScreen(
                 data =
@@ -366,6 +378,12 @@ fun GalleryNavHost(
                     setTopBarVisible = { hideTopBar = !it },
                     sessionId = sessionId,
                     setCustomNavigateUpCallback = { customNavigateUpCallback = it },
+                    setSystemPromptProvider = { provider, onPromptChanged ->
+                      customPromptProvider = provider
+                      customOnPromptChanged = onPromptChanged
+                    },
+                    setHistoryClickHandler = { customHistoryClickHandler = it },
+                    setDefaultSystemPromptProvider = { customDefaultPromptProvider = it },
                   )
               )
             }
@@ -463,6 +481,15 @@ fun GalleryNavHost(
     }
   }
 
+  // Shown on top of whichever screen is active, since the app may skip the home screen at launch
+  // (e.g. via the STARTUP_SCREEN flag or a deep link).
+  if (modelManagerUiState.showLocalTestAllowlistDialog) {
+    LocalTestAllowlistDialog(
+      filePath = MODEL_ALLOWLIST_TEST_FILE_PATH,
+      onDismiss = { modelManagerViewModel.dismissLocalTestAllowlistDialog() },
+    )
+  }
+
   // Handle incoming intents for deep links
   val intent = androidx.activity.compose.LocalActivity.current?.intent
   val data = intent?.data
@@ -533,6 +560,11 @@ private fun CustomTaskScreen(
   hideTopBar: Boolean,
   useThemeColor: Boolean,
   onNavigateUp: () -> Unit,
+  allowEditingSystemPrompt: Boolean = false,
+  curSystemPrompt: String = "",
+  defaultSystemPrompt: String = task.defaultSystemPrompt,
+  onSystemPromptChanged: (String) -> Unit = {},
+  onHistoryClicked: (() -> Unit)? = null,
   content: @Composable (bottomPadding: Dp, selectedModel: Model) -> Unit,
 ) {
   val modelManagerUiState by modelManagerViewModel.uiState.collectAsState()
@@ -592,7 +624,8 @@ private fun CustomTaskScreen(
           modelManagerViewModel = modelManagerViewModel,
           inProgress = disableAppBarControls,
           modelPreparing = disableAppBarControls,
-          shouldShowHistoryButton = false,
+          shouldShowHistoryButton = onHistoryClicked != null,
+          onHistoryClicked = { onHistoryClicked?.invoke() },
           useThemeColor = useThemeColor,
           modifier =
             Modifier.onGloballyPositioned { coordinates -> appBarHeight = coordinates.size.height },
@@ -618,6 +651,10 @@ private fun CustomTaskScreen(
               modelManagerViewModel.selectModel(model = newSelectedModel)
             }
           },
+          allowEditingSystemPrompt = allowEditingSystemPrompt,
+          curSystemPrompt = curSystemPrompt,
+          defaultSystemPrompt = defaultSystemPrompt,
+          onSystemPromptChanged = onSystemPromptChanged,
         )
       }
     }

@@ -145,17 +145,31 @@ fun ModelNameAndStatus(
       )
     }
 
-    // Model name and action buttons.
-    Text(
-      model.displayName.ifEmpty { model.name },
-      maxLines = 1,
-      overflow = TextOverflow.MiddleEllipsis,
-      style = MaterialTheme.typography.titleMedium,
+    // Model name and optional ASR/TTS modality badge.
+    Row(
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.spacedBy(8.dp),
       modifier = Modifier.padding(end = 64.dp),
-    )
+    ) {
+      Text(
+        model.displayName.ifEmpty { model.name },
+        maxLines = 1,
+        overflow = TextOverflow.MiddleEllipsis,
+        style = MaterialTheme.typography.titleMedium,
+        modifier = Modifier.weight(1f, fill = false),
+      )
+    }
 
     // Status icon + size + download progress details.
-    if (!model.isAiCore && showModelSizeAndDownloadProgressLabel) {
+    val showStatusForNonDownloadable =
+      downloadStatus?.status == ModelDownloadStatusType.UNAVAILABLE ||
+        downloadStatus?.status == ModelDownloadStatusType.FAILED ||
+        downloadStatus?.status == ModelDownloadStatusType.IN_PROGRESS
+    if (
+      !model.autoDownloadsOnStartup &&
+        showModelSizeAndDownloadProgressLabel &&
+        (model.supportsTopLevelDownload || showStatusForNonDownloadable)
+    ) {
       ModelStatusDetails(
         model = model,
         task = task,
@@ -197,7 +211,6 @@ fun ModelStatusDetails(
 ) {
   val inProgress = downloadStatus?.status == ModelDownloadStatusType.IN_PROGRESS
   val isPartiallyDownloaded = downloadStatus?.status == ModelDownloadStatusType.PARTIALLY_DOWNLOADED
-  var curDownloadProgress = 0f
 
   Row(verticalAlignment = Alignment.CenterVertically, modifier = modifier) {
     // Status icon.
@@ -212,7 +225,9 @@ fun ModelStatusDetails(
     if (downloadStatus != null && downloadStatus.status == ModelDownloadStatusType.FAILED) {
       Row(verticalAlignment = Alignment.CenterVertically) {
         Text(
-          downloadStatus.errorMessage,
+          downloadStatus.errorMessage.ifEmpty {
+            stringResource(R.string.model_download_failed_status)
+          },
           color = MaterialTheme.colorScheme.error,
           style = labelSmallNarrow,
           overflow = TextOverflow.Ellipsis,
@@ -230,31 +245,34 @@ fun ModelStatusDetails(
       if (downloadStatus != null) {
         // For in-progress model, show {receivedSize} / {totalSize} - {rate} - {remainingTime}
         if (inProgress || isPartiallyDownloaded) {
-          var totalSize = downloadStatus.totalBytes
-          if (totalSize == 0L) {
-            totalSize = model.downloadInfo.totalBytes
-          }
-          sizeLabel =
-            "${downloadStatus.receivedBytes.humanReadableSize(extraDecimalForGbAndAbove = true)} of ${totalSize.humanReadableSize()}"
-          if (downloadStatus.bytesPerSecond > 0) {
-            sizeLabel = "$sizeLabel · ${downloadStatus.bytesPerSecond.humanReadableSize()} / s"
-            // if (downloadStatus.remainingMs >= 0) {
-            //   sizeLabel =
-            //     "$sizeLabel\n${downloadStatus.remainingMs.formatToHourMinSecond()} left"
-            // }
-          }
-          if (isPartiallyDownloaded) {
-            sizeLabel = "$sizeLabel (resuming...)"
-          }
-          curDownloadProgress =
-            downloadStatus.receivedBytes.toFloat() / downloadStatus.totalBytes.toFloat()
-          if (curDownloadProgress.isNaN()) {
-            curDownloadProgress = 0f
+          if (!model.downloadsViaRepository && downloadStatus.totalBytes == 0L) {
+            sizeLabel = stringResource(R.string.cd_downloading_icon)
+          } else {
+            var totalSize = downloadStatus.totalBytes
+            if (totalSize == 0L) {
+              totalSize = model.downloadInfo.totalBytes
+            }
+            sizeLabel =
+              "${downloadStatus.receivedBytes.humanReadableSize(extraDecimalForGbAndAbove = true)} of ${totalSize.humanReadableSize()}"
+            if (downloadStatus.bytesPerSecond > 0) {
+              sizeLabel = "$sizeLabel · ${downloadStatus.bytesPerSecond.humanReadableSize()} / s"
+              // if (downloadStatus.remainingMs >= 0) {
+              //   sizeLabel =
+              //     "$sizeLabel\n${downloadStatus.remainingMs.formatToHourMinSecond()} left"
+              // }
+            }
+            if (isPartiallyDownloaded) {
+              sizeLabel = "$sizeLabel (resuming...)"
+            }
           }
         }
         // Status for unzipping.
         else if (downloadStatus.status == ModelDownloadStatusType.UNZIPPING) {
           sizeLabel = "Unzipping..."
+        }
+        // Status for unavailable model.
+        else if (downloadStatus.status == ModelDownloadStatusType.UNAVAILABLE) {
+          sizeLabel = stringResource(R.string.model_unavailable_status)
         }
       }
 

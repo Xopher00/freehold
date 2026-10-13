@@ -5,7 +5,7 @@ package com.google.ai.edge.gallery.relay.runtime.llamacpp
 import com.google.ai.edge.gallery.relay.runtime.CountKind
 import com.google.ai.edge.gallery.runtime.LlmModelHelper
 import com.google.ai.edge.gallery.runtime.ResultListener
-import com.google.ai.edge.gallery.runtime.StructuredOutputRequest
+import com.google.ai.edge.gallery.relay.runtime.maxOutputTokensFrom
 import com.google.ai.edge.gallery.runtime.CleanUpListener
 import com.google.ai.edge.gallery.relay.runtime.TokenCount
 import com.google.ai.edge.gallery.relay.runtime.TurnTokenUsage
@@ -58,7 +58,9 @@ object LlamaCppModelHelper : LlmModelHelper {
         systemInstruction: Contents?,
         tools: List<ToolProvider>,
         enableConversationConstrainedDecoding: Boolean,
+        initialMessages: List<Message>,
         coroutineScope: CoroutineScope?,
+        enableResponseFormat: Boolean,
     ) {
         val topK = model.getIntConfigValue(key = ConfigKeys.TOPK, defaultValue = DEFAULT_TOPK)
         val topP = model.getFloatConfigValue(key = ConfigKeys.TOPP, defaultValue = DEFAULT_TOPP)
@@ -107,6 +109,7 @@ object LlamaCppModelHelper : LlmModelHelper {
         tools: List<ToolProvider>,
         enableConversationConstrainedDecoding: Boolean,
         initialMessages: List<Message>,
+        enableResponseFormat: Boolean,
     ) {
         val engine = engines[model.name] ?: return
         val modelPath = engine.lastModelPath ?: return
@@ -165,12 +168,10 @@ object LlamaCppModelHelper : LlmModelHelper {
         images: List<Bitmap>,
         audioClips: List<ByteArray>,
         coroutineScope: CoroutineScope?,
-        extraContext: Map<String, String>?,
-        sessionId: String?,
-        messageIndex: Int?,
-        maxOutputTokens: Int?,
-        responseFormat: StructuredOutputRequest?,
+        extraContext: Map<String, String>,
+        responseJsonSchema: String?,
     ) {
+        val maxOutputTokens = maxOutputTokensFrom(extraContext)
         val engine = engines[model.name]
         if (engine == null || !engine.isModelLoaded.get()) {
             onError("llama.cpp engine not initialized for ${model.name}")
@@ -223,7 +224,7 @@ object LlamaCppModelHelper : LlmModelHelper {
                     TurnUsageStore.abort(model.name)
                     onError(e.message ?: "Inference error")
                 },
-                schemaJson = responseFormat?.schemaJson,
+                schemaJson = responseJsonSchema,
             )
         } catch (e: Exception) {
             // generateResponse can throw synchronously before any callback fires.

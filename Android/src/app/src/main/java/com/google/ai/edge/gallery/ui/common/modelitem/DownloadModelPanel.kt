@@ -69,6 +69,7 @@ fun DownloadModelPanel(
   tosViewModel: TosViewModel? = null,
   downloadButtonBackgroundColor: Color = MaterialTheme.colorScheme.surfaceContainer,
   isUpdatable: Boolean = false,
+  canShowTryIt: Boolean = true,
 ) {
   with(sharedTransitionScope) {
     Row(
@@ -77,9 +78,11 @@ fun DownloadModelPanel(
       verticalAlignment = Alignment.CenterVertically,
     ) {
       fun isDownloadButtonEnabled(downloadStatus: ModelDownloadStatusType?, model: Model): Boolean {
+        if (downloadStatus == ModelDownloadStatusType.UNAVAILABLE) {
+          return false
+        }
         val downloadFailed = downloadStatus == ModelDownloadStatusType.FAILED
-        val isLitertLm = model.isLiteRtLm
-        return !downloadFailed || isLitertLm
+        return !downloadFailed || model.isLiteRtLm
       }
 
       val downloadSucceeded = downloadStatus == ModelDownloadStatusType.SUCCEEDED
@@ -177,24 +180,31 @@ fun DownloadModelPanel(
         Spacer(modifier = Modifier.width(8.dp))
       }
 
-      DownloadAndTryButton(
-        task = task,
-        model = model,
-        downloadStatus = downloadStatus,
-        downloadProgress = downloadProgress,
-        enabled = isDownloadButtonEnabled(downloadStatus, model),
-        modelManagerViewModel = modelManagerViewModel,
-        onClicked = onTryItClicked,
-        compact = !isExpanded,
-        modifier =
-          Modifier.sharedElement(
-            sharedContentState = rememberSharedContentState(key = "download_button_${model.name}"),
-            animatedVisibilityScope = animatedVisibilityScope,
-          ),
-        modifierWhenExpanded = Modifier.weight(1f),
-        tosViewModel = tosViewModel ?: hiltViewModel(),
-        downloadButtonBackgroundColor = downloadButtonBackgroundColor,
-      )
+      // Supplementary models on system-managed runtimes have no top-level download.
+      val canDownloadTopLevel =
+        !downloadSucceeded && (!model.isSupplementary || model.supportsTopLevelDownload)
+      if (canDownloadTopLevel || canShowTryIt) {
+        DownloadAndTryButton(
+          task = task,
+          model = model,
+          downloadStatus = downloadStatus,
+          downloadProgress = downloadProgress,
+          enabled = isDownloadButtonEnabled(downloadStatus, model),
+          modelManagerViewModel = modelManagerViewModel,
+          onClicked = onTryItClicked,
+          compact = !isExpanded,
+          canShowTryIt = canShowTryIt,
+          modifier =
+            Modifier.sharedElement(
+              sharedContentState =
+                rememberSharedContentState(key = "download_button_${model.name}"),
+              animatedVisibilityScope = animatedVisibilityScope,
+            ),
+          modifierWhenExpanded = Modifier.weight(1f),
+          tosViewModel = tosViewModel ?: hiltViewModel(),
+          downloadButtonBackgroundColor = downloadButtonBackgroundColor,
+        )
+      }
     }
   }
 }

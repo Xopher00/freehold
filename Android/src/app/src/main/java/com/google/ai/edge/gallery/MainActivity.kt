@@ -52,6 +52,8 @@ import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.google.ai.edge.gallery.common.PermissionsResultListener
+import com.google.ai.edge.gallery.common.VirtualDevicePermissionsHost
 import com.google.ai.edge.gallery.relay.server.ServerRuntime
 import com.google.ai.edge.gallery.relay.server.loadModel
 import com.google.ai.edge.gallery.ui.lock.AppLockScreen
@@ -61,15 +63,25 @@ import com.google.ai.edge.gallery.ui.theme.GalleryTheme
 import com.google.ai.edge.litertlm.ExperimentalApi
 import com.google.ai.edge.litertlm.ExperimentalFlags
 import dagger.hilt.android.AndroidEntryPoint
+import java.util.concurrent.CopyOnWriteArraySet
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @AndroidEntryPoint
-class MainActivity : FragmentActivity() {
+class MainActivity : FragmentActivity(), VirtualDevicePermissionsHost {
 
   private val modelManagerViewModel: ModelManagerViewModel by viewModels()
+  private val permissionsResultListeners = CopyOnWriteArraySet<PermissionsResultListener>()
   private var splashScreenAboutToExit: Boolean = false
   private var contentSet: Boolean = false
+
+  override fun registerPermissionsResultListener(listener: PermissionsResultListener) {
+    permissionsResultListeners.add(listener)
+  }
+
+  override fun unregisterPermissionsResultListener(listener: PermissionsResultListener) {
+    permissionsResultListeners.remove(listener)
+  }
 
   override fun onCreate(savedInstanceState: Bundle?) {
     // We intentionally pass null to discard the saved instance state bundle.
@@ -258,6 +270,18 @@ class MainActivity : FragmentActivity() {
       } else {
         intent.data = link.toUri()
       }
+    }
+  }
+
+  override fun onRequestPermissionsResult(
+    requestCode: Int,
+    permissions: Array<out String>,
+    grantResults: IntArray,
+    deviceId: Int,
+  ) {
+    super.onRequestPermissionsResult(requestCode, permissions, grantResults, deviceId)
+    for (listener in permissionsResultListeners) {
+      listener.onPermissionsResult(requestCode, permissions, grantResults, deviceId)
     }
   }
 

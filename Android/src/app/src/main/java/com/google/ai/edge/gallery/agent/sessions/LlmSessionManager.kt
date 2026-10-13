@@ -126,6 +126,15 @@ interface LlmSessionManager {
   )
 
   /**
+   * Registers the configuration to use for [sessionId] and sets it as [activeSessionId] without
+   * resetting the conversation on the model.
+   *
+   * @param sessionId The session identifier to register.
+   * @param config The [SessionConfig] to associate with [sessionId].
+   */
+  fun setSessionConfig(sessionId: String, config: SessionConfig)
+
+  /**
    * Lists metadata for all persisted chat sessions.
    *
    * @param taskId Optional task ID filter. If null, returns sessions across all tasks.
@@ -167,7 +176,7 @@ interface LlmSessionManager {
    *
    * Assumes only one session and inference operation can run at a time in the application.
    *
-   * @param sessionId The session identifier for conversation lifecycle and telemetry correlation.
+   * @param sessionId The session identifier.
    * @param model The model to run inference on.
    * @param input The text query input.
    * @param resultListener Callback receiving partial tokens, completion status, and thinking
@@ -182,8 +191,6 @@ interface LlmSessionManager {
    * @param audioClips Optional input audio clips.
    * @param extraContext Optional key-value parameters for engine inference (e.g.
    *   "enable_thinking").
-   * @param messageIndex Optional sequential message index within the conversation for telemetry
-   *   correlation.
    */
   suspend fun generateResponse(
     sessionId: String,
@@ -197,7 +204,6 @@ interface LlmSessionManager {
     images: List<Bitmap> = emptyList(),
     audioClips: List<ByteArray> = emptyList(),
     extraContext: Map<String, String> = emptyMap(),
-    messageIndex: Int? = null,
   )
 
   /**

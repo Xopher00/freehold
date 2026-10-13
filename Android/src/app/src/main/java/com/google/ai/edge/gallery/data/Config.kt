@@ -42,6 +42,7 @@ enum class ConfigEditorType {
   BOOLEAN_SWITCH,
   SEGMENTED_BUTTON,
   BOTTOMSHEET_SELECTOR,
+  DROPDOWN,
 }
 
 /** The data types of configuration values. */
@@ -116,6 +117,12 @@ object ConfigKeys {
   val ACCELERATOR = ConfigKey("accelerator", "Accelerator", R.string.config_label_accelerator)
   val VISION_ACCELERATOR =
     ConfigKey("vision_accelerator", "Vision accelerator", R.string.config_label_vision_accelerator)
+  val VISUAL_TOKEN_BUDGET =
+    ConfigKey(
+      "visual_token_budget",
+      "Visual token budget",
+      R.string.config_label_visual_token_budget,
+    )
   val COMPATIBLE_ACCELERATORS =
     ConfigKey(
       "compatible_accelerators",
@@ -171,6 +178,15 @@ open class Config(
   companion object {
     /** Returns whether the context compaction feature is enabled via feature flags. */
     fun isContextCompactEnabled(): Boolean = false
+
+    /** Creates the configuration setting for automatic context compaction. */
+    fun createAutoContextCompactConfig(): Config =
+      BooleanSwitchConfig(
+        key = ConfigKeys.ENABLE_AUTO_CONTEXT_COMPACT,
+        defaultValue = false,
+        needReinitialization = false,
+        descriptionRes = R.string.config_desc_enable_context_compression,
+      )
 
     /**
      * Creates the configuration settings displayed when importing an LLM model.
@@ -288,6 +304,22 @@ class BottomSheetSelectorConfig(
 
 data class BottomSheetSelectorItem(val label: String)
 
+/** Configuration setting for a dropdown menu selector. */
+class DropdownConfig(
+  override val key: ConfigKey,
+  override val defaultValue: String,
+  val options: List<String>,
+  override val valueType: ValueType = ValueType.INT,
+  override val needReinitialization: Boolean = true,
+) :
+  Config(
+    type = ConfigEditorType.DROPDOWN,
+    key = key,
+    defaultValue = defaultValue,
+    valueType = valueType,
+    needReinitialization = needReinitialization,
+  )
+
 fun convertValueToTargetType(value: Any, valueType: ValueType): Any {
   return when (valueType) {
     ValueType.INT ->
@@ -394,7 +426,6 @@ fun createLlmChatConfigs(
   accelerators: List<Accelerator> = DEFAULT_ACCELERATORS,
   supportThinking: Boolean = false,
   supportSpeculativeDecoding: Boolean = false,
-  supportContextCompression: Boolean = true,
 ): List<Config> {
   var maxTokensConfig: Config =
     LabelConfig(key = ConfigKeys.MAX_TOKENS, defaultValue = "$defaultMaxToken")
@@ -429,9 +460,6 @@ fun createLlmChatConfigs(
       BooleanSwitchConfig(key = ConfigKeys.ENABLE_SPECULATIVE_DECODING, defaultValue = false)
     )
   }
-  if (supportContextCompression && Config.isContextCompactEnabled()) {
-    configs.add(createAutoContextCompactConfig())
-  }
   return configs
 }
 
@@ -443,7 +471,6 @@ fun createLlmChatConfigs(
 fun createLlmChatConfigsForNpuModel(
   defaultMaxToken: Int = DEFAULT_MAX_TOKEN,
   accelerators: List<Accelerator> = DEFAULT_ACCELERATORS,
-  supportContextCompression: Boolean = true,
 ): List<Config> = buildList {
   add(LabelConfig(key = ConfigKeys.MAX_TOKENS, defaultValue = "$defaultMaxToken"))
   add(
@@ -453,18 +480,7 @@ fun createLlmChatConfigsForNpuModel(
       options = accelerators.map { it.label },
     )
   )
-  if (supportContextCompression && Config.isContextCompactEnabled()) {
-    add(createAutoContextCompactConfig())
-  }
 }
-
-private fun createAutoContextCompactConfig(): Config =
-  BooleanSwitchConfig(
-    key = ConfigKeys.ENABLE_AUTO_CONTEXT_COMPACT,
-    defaultValue = false,
-    needReinitialization = false,
-    descriptionRes = R.string.config_desc_enable_context_compression,
-  )
 
 /**
  * Creates the configuration settings for an AICore model.

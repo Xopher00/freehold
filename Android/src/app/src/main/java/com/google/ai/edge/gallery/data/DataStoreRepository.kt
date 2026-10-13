@@ -125,6 +125,12 @@ interface DataStoreRepository {
   fun saveServerStartOnBoot(enabled: Boolean)
 
   fun readServerStartOnBoot(): Boolean
+
+  /** Saves whether automatic context compaction is enabled for the specified [taskId]. */
+  fun saveAutoContextCompact(taskId: String, enabled: Boolean)
+
+  /** Returns whether automatic context compaction is enabled for the specified [taskId]. */
+  fun readAutoContextCompact(taskId: String): Boolean
 }
 
 /** Repository for managing data using Proto DataStore. */
@@ -518,6 +524,21 @@ class DefaultDataStoreRepository(
         dataStore.updateData { settings -> settings.toBuilder().setStartServerOnBoot(false).build() }
       }
       legacy
+    }
+  }
+
+  override fun saveAutoContextCompact(taskId: String, enabled: Boolean) {
+    runBlocking {
+      dataStore.updateData { settings ->
+        settings.toBuilder().putAutoContextCompactByTask(taskId, enabled).build()
+      }
+    }
+  }
+
+  override fun readAutoContextCompact(taskId: String): Boolean {
+    return runBlocking {
+      val settings = dataStore.data.first()
+      settings.autoContextCompactByTaskMap[taskId] ?: false
     }
   }
 }

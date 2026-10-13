@@ -36,6 +36,8 @@ private const val TEST_MODEL_ALLOW_LIST = ""
 // Copy of ModelManagerViewModel.kt's private list; keep in sync with the disk-reader twin below.
 private val PREDEFINED_LLM_TASK_ORDER =
   listOf(
+    BuiltInTaskId.SMART_ALBUM,
+    BuiltInTaskId.VIDEO_MOMENT_FINDER,
     BuiltInTaskId.LLM_CHAT,
     BuiltInTaskId.LLM_AGENT_CHAT,
     BuiltInTaskId.LLM_ASK_IMAGE,
@@ -56,6 +58,10 @@ class ModelAllowlistLoader(
   private var _allowlistModels: MutableList<Model> = mutableListOf()
   val allowlistModels: List<Model>
     get() = _allowlistModels
+
+  @Volatile
+  var loadedFromTestAllowlist: Boolean = false
+    private set
 
   // Synchronized, not Mutex: the check-and-create decision below never suspends.
   private val allowlistLoadLock = Any()
@@ -194,6 +200,7 @@ class ModelAllowlistLoader(
     Log.d(TAG, "Loading test model allowlist.")
     var modelAllowlist =
       readModelAllowlistFromDisk(modelsDir, fileName = MODEL_ALLOWLIST_TEST_FILENAME)
+    loadedFromTestAllowlist = modelAllowlist != null
 
     if (TEST_MODEL_ALLOW_LIST.isNotEmpty()) {
       Log.d(TAG, "Loading local model allowlist for testing.")
@@ -278,10 +285,16 @@ class ModelAllowlistLoader(
         }
       }
 
-      val model = allowedModel.toModel()
+      val model = allowedModel.toModel() ?: continue
+
+      if (model.isSupplementary) {
+        allowlistModels.add(model)
+        continue
+      }
+
       allowlistModels.add(model)
       nameToModel.put(model.name, model)
-      for (taskType in allowedModel.taskTypes) {
+      for (taskType in allowedModel.taskTypes.orEmpty()) {
         if (taskType == BuiltInTaskId.LLM_TEST) continue
         val task = curTasks.find { it.id == taskType }
         if (task != null && task.models.none { it.name == model.name }) {

@@ -112,6 +112,15 @@ data class Task(
   /** The default system prompt for this task. */
   val defaultSystemPrompt: String = "",
 
+  /** Whether this task uses vision/image input when the selected model also supports image. */
+  val supportImage: Boolean = false,
+
+  /** Whether this task uses audio input when the selected model also supports audio. */
+  val supportAudio: Boolean = false,
+
+  /** Whether this task supports multi-turn context compaction. */
+  val supportContextCompact: Boolean = false,
+
   // The following fields are only used for built-in tasks. Can ignore if you are creating your own
   // custom tasks.
   //
@@ -131,6 +140,21 @@ data class Task(
   fun allowCapability(capability: ModelCapability, model: Model): Boolean {
     return model.allowCapability(capability = capability, taskId = id)
   }
+
+  /** Whether vision is enabled for the given [model] in this task. */
+  fun isVisionEnabled(model: Model): Boolean = supportImage && model.supportImage
+
+  /** Whether audio is enabled for the given [model] in this task. */
+  fun isAudioEnabled(model: Model): Boolean = supportAudio && model.supportAudio
+
+  /**
+   * Whether context compaction is supported for the given [model] in this task.
+   *
+   * Requires the task to support multi-turn context compaction ([supportContextCompact]), a
+   * non-AICore model (`!model.isAiCore`), and the global feature flag.
+   */
+  fun isContextCompactSupported(model: Model): Boolean =
+    supportContextCompact && !model.isAiCore && Config.isContextCompactEnabled()
 }
 
 object BuiltInTaskId {
@@ -146,6 +170,8 @@ object BuiltInTaskId {
   const val LLM_AGENT_CHAT = "llm_agent_chat"
   const val IMAGE_GEN = "image_gen"
   const val WHISPER = "whisper"
+  const val SMART_ALBUM = "smart_album"
+  const val VIDEO_MOMENT_FINDER = "video_moment_finder"
 }
 
 private val allLegacyTaskIds: Set<String> =

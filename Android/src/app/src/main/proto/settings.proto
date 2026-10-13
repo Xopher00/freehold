@@ -83,6 +83,7 @@ message Settings {
   bool is_gemma_terms_accepted = 8;
 
   bool start_server_on_boot = 12;
+  map<string, bool> auto_context_compact_by_task = 15;
 }
 
 message McpAuth {

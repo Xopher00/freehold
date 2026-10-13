@@ -33,6 +33,9 @@ import com.google.ai.edge.gallery.ui.modelmanager.ModelManagerViewModel
  *   enable and disable controls (e.g. back button, configs, etc) in the app bar.
  * @param setTopBarVisible A callback function that the custom task screen can call to show and hide
  *   the top bar.
+ * @param setDefaultSystemPromptProvider A callback function that the custom task screen can call to
+ *   provide the system prompt that the config dialog restores as the default, when it differs from
+ *   `Task.defaultSystemPrompt`. Pass `null` to clear it.
  */
 data class CustomTaskData(
   val modelManagerViewModel: ModelManagerViewModel,
@@ -42,12 +45,19 @@ data class CustomTaskData(
   val setTopBarVisible: (Boolean) -> Unit = {},
   val setCustomNavigateUpCallback: ((() -> Unit)?) -> Unit = {},
   val sessionId: String? = null,
+  val setSystemPromptProvider: (((() -> String), ((String) -> Unit)) -> Unit) = { _, _ -> },
+  val setHistoryClickHandler: ((() -> Unit)?) -> Unit = {},
+  val setDefaultSystemPromptProvider: ((() -> String)?) -> Unit = {},
 )
 
 data class CustomTaskDataForBuiltinTask(
   val modelManagerViewModel: ModelManagerViewModel,
   val onNavUp: () -> Unit,
-  // The initial query to be sent to the model when the screen is first loaded.
+  // An optional query supplied through a deep link when the screen is first loaded.
+  //
+  // This value comes from an untrusted external source (another app, a web page, a QR code, ...).
+  // Consumers MUST show it to the user and require explicit confirmation before sending it to a
+  // model; it must never be sent automatically.
   val initialQuery: String? = null,
   val sessionId: String? = null,
   val autoResumeSession: Boolean = true,

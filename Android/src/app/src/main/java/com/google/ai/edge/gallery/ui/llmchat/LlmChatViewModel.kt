@@ -21,6 +21,7 @@ import android.graphics.Bitmap
 import android.os.Build
 import android.util.Log
 import androidx.lifecycle.viewModelScope
+import com.google.ai.edge.gallery.R
 import com.google.ai.edge.gallery.agent.AgentEvent
 import com.google.ai.edge.gallery.agent.AgentExecutionContext
 import com.google.ai.edge.gallery.agent.AgentRequest
@@ -31,7 +32,9 @@ import com.google.ai.edge.gallery.agent.Attachment
 import com.google.ai.edge.gallery.agent.sessions.LlmSessionManager
 import com.google.ai.edge.gallery.agent.sessions.generateSessionId
 import com.google.ai.edge.gallery.common.SystemPromptHelper
+import com.google.ai.edge.gallery.common.metrics.InferenceMetrics
 import com.google.ai.edge.gallery.data.ConfigKeys
+import com.google.ai.edge.gallery.data.DataStoreRepository
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.data.SystemPromptRepository
 import com.google.ai.edge.gallery.data.Task
@@ -41,6 +44,7 @@ import com.google.ai.edge.gallery.relay.runtime.isContextOverflow
 import com.google.ai.edge.gallery.relay.server.handlers.withBusyGuard
 import com.google.ai.edge.gallery.tools.ToolAction
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageAudioClip
+import com.google.ai.edge.gallery.ui.common.chat.ChatMessageDivider
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageError
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageInfo
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageLoading
@@ -68,6 +72,8 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 
 private const val TAG = "AGLlmChatViewModel"
@@ -78,15 +84,48 @@ open class LlmChatViewModelBase(
   private val modelFeedbackRepository: Any? = null,
   override val runtimeExecutor: AgentRuntimeExecutor,
   llmSessionManager: LlmSessionManager,
-) : ChatViewModel(runtimeExecutor, llmSessionManager) {
+  dataStoreRepository: DataStoreRepository? = null,
+) : ChatViewModel(runtimeExecutor, llmSessionManager, dataStoreRepository) {
   private val _uiSystemPrompt = MutableStateFlow("")
-  val uiSystemPrompt = _uiSystemPrompt.asStateFlow()
+  val uiSystemPrompt: StateFlow<String> = _uiSystemPrompt.asStateFlow()
+  private val _liveMetrics = MutableStateFlow<InferenceMetrics?>(null)
+  override val liveMetrics: StateFlow<InferenceMetrics?> = _liveMetrics.asStateFlow()
+  private var liveMetricsJob: Job? = null
+  private var observedLiveMetricsModel: Model? = null
   // Map to track if the session was stopped by the model for a given model name.
   private val sessionStoppedByModel = mutableMapOf<String, Boolean>()
   // The current task ID for the session.
   private var currentTaskId: String = ""
   // Active session transition job to ensure transitions (restore, new session, reset) do not race.
   private var sessionTransitionJob: Job? = null
+
+  /**
+   * Reactively observes the live [InferenceMetrics] stream of [model] across its initialization and
+   * session lifecycle, updating [liveMetrics] as snapshots are emitted.
+   */
+  override fun observeLiveMetrics(model: Model) {
+    if (model.isAiCore) {
+      observedLiveMetricsModel = model
+      liveMetricsJob?.cancel()
+      _liveMetrics.value = null
+      return
+    }
+    if (observedLiveMetricsModel === model && liveMetricsJob?.isActive == true) {
+      return
+    }
+    observedLiveMetricsModel = model
+    liveMetricsJob?.cancel()
+    _liveMetrics.value = null
+    liveMetricsJob = viewModelScope.launch {
+      model.initStatusFlow
+        .flatMapLatest { status ->
+          ((status as? Model.InitializationStatus.Initialized)?.instance as? LlmModelInstance)
+            ?.metricsTracker
+            ?.liveMetrics ?: flowOf(null)
+        }
+        .collect { metrics -> _liveMetrics.value = metrics }
+    }
+  }
 
   /**
    * Sets the system prompt in the UI.
@@ -107,6 +146,7 @@ open class LlmChatViewModelBase(
    */
   fun loadSystemPrompt(task: Task) {
     currentTaskId = task.id
+    loadAutoCompact(task.id)
     viewModelScope.launch {
       val effectivePrompt =
         SystemPromptHelper.getEffectiveSystemPrompt(systemPromptRepository, task)
@@ -156,6 +196,7 @@ open class LlmChatViewModelBase(
     onError: (String) -> Unit,
     allowThinking: Boolean = false,
   ) {
+    observeLiveMetrics(model)
     val accelerator = model.currentAccelerator?.name ?: ""
     viewModelScope.launch(Dispatchers.Default) {
       val result = withBusyGuard(
@@ -181,19 +222,9 @@ open class LlmChatViewModelBase(
           allowThinking &&
             model.getBooleanConfigValue(key = ConfigKeys.ENABLE_THINKING, defaultValue = false)
         val extraContext = if (enableThinking) mapOf("enable_thinking" to "true") else emptyMap()
-        // ChatMessageLoading was already appended above as the placeholder for the upcoming agent
-        // response (and is replaced in-place when streaming starts), so `currentMessages.size - 1`
-        // is the 0-based message list index of this turn's inference output (matching
-        // `agentMessageIndex` in `submitFeedback` / `linkFeedbackToSession`).
-        val currentMessages = uiState.value.messagesByModel[model.name] ?: emptyList()
-        val messageIndex = currentMessages.size - 1
-
         val metadata =
           buildMap<String, Any> {
             put(AgentRequest.SESSION_ID, currentSessionId)
-            if (messageIndex >= 0) {
-              put(AgentRequest.MESSAGE_INDEX, messageIndex)
-            }
             if (extraContext.isNotEmpty()) {
               put(AgentRequest.LITERTLM_EXTRA_CONTEXT, extraContext)
             }
@@ -204,7 +235,6 @@ open class LlmChatViewModelBase(
         val executionContext = AgentExecutionContext()
 
         var firstRun = true
-        var compactionSucceeded = false
         val start = System.currentTimeMillis()
 
         if (sessionStoppedByModel[model.name] == true) {
@@ -232,15 +262,16 @@ open class LlmChatViewModelBase(
           when (event) {
             is AgentEvent.LoopInitiated -> {}
             is AgentEvent.ContextCompactionStarted -> {
-              compactionSucceeded = false
               setContextCompactionStatus(model, ContextCompactionStatus.COMPACTING)
             }
             is AgentEvent.ContextCompactionFinished -> {
-              compactionSucceeded = event.success
-              if (
-                !event.success &&
-                  getContextCompactionStatus(model) == ContextCompactionStatus.COMPACTING
-              ) {
+              if (event.success) {
+                insertMessageBeforeCurrentTurn(
+                  model = model,
+                  message = ChatMessageDivider(textResId = R.string.context_compressed_success),
+                )
+              }
+              if (getContextCompactionStatus(model) == ContextCompactionStatus.COMPACTING) {
                 setContextCompactionStatus(model, ContextCompactionStatus.IDLE)
               }
             }
@@ -351,21 +382,11 @@ open class LlmChatViewModelBase(
                   )
                 }
               }
-              if (getContextCompactionStatus(model) == ContextCompactionStatus.COMPACTING) {
-                setContextCompactionStatus(
-                  model,
-                  if (compactionSucceeded) {
-                    ContextCompactionStatus.COMPACTED
-                  } else {
-                    ContextCompactionStatus.IDLE
-                  },
-                )
-              }
               setPreparing(false)
               val isLimitReached = llmSessionManager.isTokenLimitReached(currentSessionId, model)
               try {
                 if (isLimitReached) {
-                  if (isAutoCompactEnabled(model)) {
+                  if (isAutoCompactEnabled(currentTaskId)) {
                     executeCompactContext(
                       model = model,
                       taskId = currentTaskId,
@@ -423,9 +444,8 @@ open class LlmChatViewModelBase(
     }
     if (getLastMessage(model = model) is ChatMessageLoading) {
       removeLastMessage(model = model)
-    } else {
-      sessionStoppedByModel[model.name] = true
     }
+    sessionStoppedByModel[model.name] = true
     setInProgress(false)
     runtimeExecutor.interrupt()
     Log.d(TAG, "Done stopping response")
@@ -444,6 +464,7 @@ open class LlmChatViewModelBase(
     clearHistory: Boolean = true,
   ) {
     currentTaskId = task.id
+    loadAutoCompact(task.id)
     sessionTransitionJob?.cancel()
     sessionTransitionJob =
       viewModelScope.launch(Dispatchers.Default) {
@@ -528,6 +549,7 @@ open class LlmChatViewModelBase(
     onDone: () -> Unit = {},
   ) {
     currentTaskId = task.id
+    loadAutoCompact(task.id)
     sessionTransitionJob?.cancel()
     sessionTransitionJob =
       viewModelScope.launch(Dispatchers.Default) {
@@ -682,9 +704,10 @@ constructor(
   systemPromptRepository: SystemPromptRepository,
   @AiChatExecutor runtimeExecutor: AgentRuntimeExecutor,
   llmSessionManager: LlmSessionManager,
+  dataStoreRepository: DataStoreRepository? = null,
 ) :
 LlmChatViewModelBase(systemPromptRepository, null, runtimeExecutor,
-llmSessionManager)
+llmSessionManager, dataStoreRepository)
 
 @HiltViewModel
 class LlmAskImageViewModel
@@ -693,9 +716,10 @@ constructor(
   systemPromptRepository: SystemPromptRepository,
   @AiChatExecutor runtimeExecutor: AgentRuntimeExecutor,
   llmSessionManager: LlmSessionManager,
+  dataStoreRepository: DataStoreRepository? = null,
 ) :
 LlmChatViewModelBase(systemPromptRepository, null, runtimeExecutor,
-llmSessionManager)
+llmSessionManager, dataStoreRepository)
 
 @HiltViewModel
 class LlmAskAudioViewModel
@@ -704,6 +728,7 @@ constructor(
   systemPromptRepository: SystemPromptRepository,
   @AiChatExecutor runtimeExecutor: AgentRuntimeExecutor,
   llmSessionManager: LlmSessionManager,
+  dataStoreRepository: DataStoreRepository? = null,
 ) :
 LlmChatViewModelBase(systemPromptRepository, null, runtimeExecutor,
-llmSessionManager)
+llmSessionManager, dataStoreRepository)

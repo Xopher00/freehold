@@ -21,7 +21,7 @@ import android.graphics.Bitmap
 import android.util.Log
 import com.google.ai.edge.gallery.data.ChatSessionRepository
 import com.google.ai.edge.gallery.data.Config
-import com.google.ai.edge.gallery.data.ConfigKeys
+import com.google.ai.edge.gallery.data.DataStoreRepository
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.data.awaitInitialization
 import com.google.ai.edge.gallery.di.IoDispatcher
@@ -61,6 +61,7 @@ data class SessionFeedbackLink(val feedbackId: String, val messageIndex: Int? = 
  * @param context The Android application [Context].
  * @param chatSessionRepository Repository for persisting and retrieving user session data.
  * @param ioDispatcher Coroutine dispatcher for background IO operations.
+ * @param dataStoreRepository Optional repository for reading task-level user settings.
  */
 @Singleton
 class DefaultLlmSessionManager
@@ -70,6 +71,7 @@ constructor(
   private val chatSessionRepository: ChatSessionRepository,
   private val contextCompactor: ContextCompactor? = null,
   @IoDispatcher private val ioDispatcher: CoroutineDispatcher,
+  private val dataStoreRepository: DataStoreRepository? = null,
 ) : LlmSessionManager {
 
   private val feedbackLinks = ConcurrentHashMap<String, MutableList<SessionFeedbackLink>>()
@@ -200,6 +202,11 @@ constructor(
       }
     }
 
+  override fun setSessionConfig(sessionId: String, config: SessionConfig) {
+    activeSessionIdRef.set(sessionId)
+    sessionConfigs[sessionId] = config
+  }
+
   override suspend fun listSessions(taskId: String?): List<ChatSessionProto> =
     withContext(ioDispatcher) {
       val allSessions = chatSessionRepository.getAllChatSessions()
@@ -295,7 +302,6 @@ constructor(
     images: List<Bitmap>,
     audioClips: List<ByteArray>,
     extraContext: Map<String, String>,
-    messageIndex: Int?,
   ) {
     var compactionStarted = false
     try {
@@ -345,9 +351,7 @@ constructor(
       input = input,
       images = images,
       audioClips = audioClips,
-      extraContext = extraContext.ifEmpty { null },
-      sessionId = sessionId,
-      messageIndex = messageIndex,
+      extraContext = extraContext,
       resultListener = resultListener,
       cleanUpListener = cleanUpListener,
       onError = onError,
@@ -361,17 +365,15 @@ constructor(
     force: Boolean,
   ): Boolean =
     withContext(ioDispatcher) {
-      if (!Config.isContextCompactEnabled()) {
+      if (!Config.isContextCompactEnabled() || model.isAiCore) {
         return@withContext false
       }
-      if (
-        !force &&
-          !model.getBooleanConfigValue(
-            key = ConfigKeys.ENABLE_AUTO_CONTEXT_COMPACT,
-            defaultValue = false,
-          )
-      ) {
-        return@withContext false
+      if (!force) {
+        val taskId = sessionConfigs[sessionId]?.taskId ?: ""
+        val autoCompactEnabled = dataStoreRepository?.readAutoContextCompact(taskId) ?: false
+        if (!autoCompactEnabled) {
+          return@withContext false
+        }
       }
       val compactor = contextCompactor ?: return@withContext false
       sessionMutex(sessionId).withLock {
@@ -381,7 +383,7 @@ constructor(
     }
 
   override fun isTokenLimitReached(sessionId: String, model: Model): Boolean {
-    if (!Config.isContextCompactEnabled()) {
+    if (!Config.isContextCompactEnabled() || model.isAiCore) {
       return false
     }
     val compactor = contextCompactor ?: return false

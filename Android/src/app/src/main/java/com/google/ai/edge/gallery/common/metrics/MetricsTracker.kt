@@ -18,18 +18,20 @@ package com.google.ai.edge.gallery.common.metrics
 
 import android.content.Context
 import com.google.ai.edge.gallery.data.ConfigKeys
+import com.google.ai.edge.gallery.data.DEFAULT_MAX_TOKEN
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.data.supportModelBenchmark
 import com.google.ai.edge.gallery.proto.LlmConfig
 import com.google.ai.edge.gallery.proto.llmConfig
-import java.util.UUID
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicReference
 import kotlin.time.Duration
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /** Configuration options for inference metrics tracking and periodic system resource monitors. */
 data class MetricsTrackerConfig(
@@ -39,6 +41,8 @@ data class MetricsTrackerConfig(
   val memorySamplingInterval: Duration = PeriodicSampler.DEFAULT_SAMPLING_INTERVAL,
   // Sampling interval for the power monitor.
   val powerSamplingInterval: Duration = PeriodicSampler.DEFAULT_SAMPLING_INTERVAL,
+  // Update interval for the live metrics stream during an active turn.
+  val liveUpdateInterval: Duration = PeriodicSampler.DEFAULT_LIVE_UPDATE_INTERVAL,
 )
 
 /**
@@ -46,20 +50,24 @@ data class MetricsTrackerConfig(
  * active model conversation session.
  *
  * ## Lifecycle
- * A [MetricsTracker] instance is designed to be created when a [Model] instance is initialized, and
- * destroyed when that model is unloaded, reset, or recreated with updated configurations. During
- * the tracker's lifetime, model metadata and LLM sampler configurations remain constant.
+ * A [MetricsTracker] instance is created when a [Model] instance is initialized, and destroyed when
+ * that model is unloaded. When a conversation is recreated with updated sampler or thinking
+ * settings via `resetConversation`, [resetSession] refreshes the active session metadata and resets
+ * cumulative context and turn counters.
  */
 interface MetricsTracker {
-  /** The active model associated with this conversation tracker instance. */
-  val model: Model
-
-  /** The task or feature identifier (e.g. "llm_chat", "agent_chat", "benchmark"). */
-  val taskId: String
+  /**
+   * Hot stream of real-time [InferenceMetrics] snapshots for the active model session.
+   *
+   * Emits `null` before initialization or when metrics tracking is disabled (e.g.
+   * [NoOpMetricsTracker]), and emits updated [InferenceMetrics] snapshots on lifecycle milestones
+   * and periodically during active inference turns.
+   */
+  val liveMetrics: StateFlow<InferenceMetrics?>
 
   /**
    * Records the model's initialization outcome (`Initialized` or `Failed`), duration, and active
-   * sampler configuration from [model], dispatching telemetry to Logcat and Firebase Analytics when
+   * sampler configuration from [Model], dispatching telemetry to Logcat and Firebase Analytics when
    * metrics tracking is enabled.
    */
   fun onModelInitialized()
@@ -67,13 +75,13 @@ interface MetricsTracker {
   /**
    * Starts tracking an inference turn using a [ConversationSession] abstraction.
    *
+   * The tracker assigns each started turn the next 0-based turn index of the current session;
+   * [resetSession] restarts the count at 0. No-ops if [session] is not alive or a turn is already
+   * active.
+   *
    * @param session Active session abstraction for ground-truth telemetry.
-   * @param sessionId Optional conversation session ID for telemetry correlation.
-   * @param turnIndex Optional 0-based message list index or sequential turn index for telemetry
-   *   correlation.
-   * @throws IllegalStateException if a previous turn was not ended, or if [session] is dead.
    */
-  fun startTurn(session: ConversationSession, sessionId: String? = null, turnIndex: Int? = null)
+  fun startTurn(session: ConversationSession)
 
   /**
    * Universal streaming token callback.
@@ -82,20 +90,16 @@ interface MetricsTracker {
    *
    * @param tokenText The generated text piece for this token callback.
    * @param thinkingText Optional thinking/reasoning text emitted by thinking models.
-   * @throws IllegalStateException if called outside of an active turn.
    */
   fun onNewToken(tokenText: String, thinkingText: String? = null)
 
   /**
-   * Cancels the active inference turn (e.g. when manually cancelled by the user).
+   * Ends the active turn as [InferenceStatus.Code.CANCELLED] (for example, when the user taps Stop)
+   * and logs its metrics.
    *
-   * Halts hardware monitors, records partial streamed token counts, finalizes the turn status with
-   * [InferenceStatus.Code.CANCELLED] and the provided [reason], logs to ADB, and returns the
-   * resulting [InferenceMetrics] (or `null` if benchmark tracking is disabled).
-   *
-   * @param reason The reason describing why the turn was cancelled.
-   * @param customMessage Optional descriptive message describing the cancellation.
-   * @return The finalized [InferenceMetrics] with CANCELLED status, or null if benchmark disabled.
+   * @param reason Why the turn was cancelled.
+   * @param customMessage Optional message that describes the cancellation.
+   * @return The turn's metrics, or null if no turn is active or tracking is disabled.
    */
   fun cancelTurn(
     reason: CancellationReason = CancellationReason.USER_CANCELLED,
@@ -103,26 +107,26 @@ interface MetricsTracker {
   ): InferenceMetrics?
 
   /**
-   * Resets active metrics and counters when a conversation session is cleared.
-   *
-   * Resets cumulative session context tokens and clears hardware sensor histories (e.g. when the
-   * user clears chat history or starts a new conversation).
+   * Starts a new session after the conversation is cleared or recreated. Refreshes the session
+   * metadata and restarts the turn index and the context token count. Drops an active turn without
+   * logging it.
    */
   fun resetSession()
 
   /**
-   * Finalizes the active inference turn, queries ground-truth engine metrics from the
-   * [ConversationSession], samples hardware monitors, logs to ADB, and returns [InferenceMetrics].
+   * Ends the active turn with [statusCode] and logs its metrics.
    *
-   * @param statusCode Result status code for the inference turn.
-   * @param errorMessage Optional error message if inference failed.
-   * @return The finalized, immutable [InferenceMetrics] protobuf, or null if benchmark disabled.
-   * @throws IllegalStateException if called when no turn is in progress.
+   * @param statusCode The turn's result.
+   * @param errorMessage Optional error message if the turn failed.
+   * @return The turn's metrics, or null if no turn is active or tracking is disabled.
    */
   fun endTurn(
     statusCode: InferenceStatus.Code = InferenceStatus.Code.SUCCESS,
     errorMessage: String? = null,
   ): InferenceMetrics?
+
+  /** Releases background sampling resources when the model instance is unloaded. */
+  fun close() {}
 
   companion object {
     /**
@@ -145,7 +149,7 @@ interface MetricsTracker {
       if (!enableInferenceMetrics) {
         // Returns a no-op tracker if benchmark telemetry is disabled or the model does not support
         // benchmark mode.
-        return NoOpMetricsTracker(model = model, taskId = taskId)
+        return NoOpMetricsTracker()
       }
 
       return LitertlmMetricsTracker(
@@ -162,13 +166,15 @@ interface MetricsTracker {
 
 /**
  * No-op implementation of [MetricsTracker] used when benchmark telemetry is disabled or unsupported
- * for [model].
+ * for [Model].
  */
-class NoOpMetricsTracker(override val model: Model, override val taskId: String) : MetricsTracker {
+class NoOpMetricsTracker : MetricsTracker {
+  override val liveMetrics: StateFlow<InferenceMetrics?> =
+    MutableStateFlow<InferenceMetrics?>(null).asStateFlow()
 
   override fun onModelInitialized() {}
 
-  override fun startTurn(session: ConversationSession, sessionId: String?, turnIndex: Int?) {}
+  override fun startTurn(session: ConversationSession) {}
 
   override fun onNewToken(tokenText: String, thinkingText: String?) {}
 
@@ -190,16 +196,20 @@ class NoOpMetricsTracker(override val model: Model, override val taskId: String)
  */
 class LitertlmMetricsTracker
 internal constructor(
-  private val context: Context,
-  override val model: Model,
-  override val taskId: String,
+  context: Context,
+  private val model: Model,
+  private val taskId: String,
   ioDispatcher: CoroutineDispatcher,
-  timeSource: TimeSource = TimeSource.Monotonic,
-  private val config: MetricsTrackerConfig = MetricsTrackerConfig(),
-  internal val metricsLogger: MetricsLogger = MetricsLogger(model = model, taskId = taskId),
+  private val timeSource: TimeSource = TimeSource.Monotonic,
+  config: MetricsTrackerConfig = MetricsTrackerConfig(),
+  private val metricsLogger: MetricsLogger = MetricsLogger(model = model, taskId = taskId),
   private val memoryMonitor: PeriodicSensorMonitor<MemoryMetrics>? =
     if (config.enableSystemSampling) {
-      MemoryMonitor(samplingInterval = config.memorySamplingInterval, dispatcher = ioDispatcher)
+      MemoryMonitor(
+        context = context,
+        samplingInterval = config.memorySamplingInterval,
+        dispatcher = ioDispatcher,
+      )
     } else {
       null
     },
@@ -213,8 +223,6 @@ internal constructor(
     } else {
       null
     },
-  private val inferenceTracker: LitertlmInferenceMetricsTracker =
-    LitertlmInferenceMetricsTracker(model = model, timeSource = timeSource),
 ) : MetricsTracker {
 
   init {
@@ -223,13 +231,36 @@ internal constructor(
     }
   }
 
-  // Immutable metadata captured at construction time.
-  private val baseMetadata: InferenceMetadata = buildBaseMetadata()
+  private val _liveMetrics = MutableStateFlow<InferenceMetrics?>(null)
+  override val liveMetrics: StateFlow<InferenceMetrics?> = _liveMetrics.asStateFlow()
 
-  private data class TurnContext(val sessionId: String, val turnIndex: Int)
+  /**
+   * Active session metadata (model name, accelerator, task ID, initialization duration, and LLM
+   * sampler configuration). Initialized in [onModelInitialized] and refreshed in [resetSession]
+   * when a conversation is recreated with updated sampler or thinking settings.
+   */
+  @Volatile private var metadata: InferenceMetadata = buildMetadata()
 
-  private val isTurnActive = AtomicBoolean(false)
-  private val turnContext = AtomicReference<TurnContext?>(null)
+  /**
+   * Per-session inference tracker, created in [onModelInitialized] and recreated in [resetSession]
+   * when a new conversation session starts.
+   */
+  @Volatile private var inferenceTracker: LitertlmInferenceMetricsTracker? = null
+
+  /**
+   * Refreshes the internal state when a new conversation session is started: session metadata and
+   * [LitertlmInferenceMetricsTracker].
+   *
+   * Aborts any active turn in the previous session and creates a new
+   * [LitertlmInferenceMetricsTracker] with the updated metadata.
+   */
+  private fun refreshSessionTracker() {
+    val newMetadata = buildMetadata()
+    metadata = newMetadata
+    inferenceTracker?.abortActiveTurn()
+    inferenceTracker =
+      LitertlmInferenceMetricsTracker(metadata = newMetadata, timeSource = timeSource)
+  }
 
   /**
    * Scope the periodic sensor samplers run on, kept off the main thread by `ioDispatcher`. A
@@ -238,122 +269,154 @@ internal constructor(
    */
   private val scope = CoroutineScope(ioDispatcher + SupervisorJob())
 
+  /**
+   * Whether live metrics streaming is enabled for this tracker instance. Captured once at
+   * construction time so the live stream behavior remains consistent across the session.
+   */
+  private val enableLiveMetrics: Boolean = false
+
+  private val liveUpdateSampler: PeriodicSampler? =
+    if (enableLiveMetrics) {
+      PeriodicSampler(
+        samplingInterval = config.liveUpdateInterval,
+        dispatcher = ioDispatcher,
+        onSample = ::emitLiveSnapshotIfTurnActive,
+      )
+    } else {
+      null
+    }
+
+  @Synchronized
   override fun onModelInitialized() {
+    refreshSessionTracker()
     metricsLogger.logModelInitialization()
+    if (model.initStatusFlow.value !is Model.InitializationStatus.Failed) {
+      emitLiveSnapshot()
+    }
   }
 
-  override fun startTurn(session: ConversationSession, sessionId: String?, turnIndex: Int?) {
-    // Step 1: Validate session & conversation preconditions.
-    check(session.isAlive) {
-      "Cannot start turn for '${model.name}': conversation is not alive (already closed or uninitialized)."
+  @Synchronized
+  override fun startTurn(session: ConversationSession) {
+    if (inferenceTracker?.startTurn(session = session) != true) {
+      return
     }
-    check(isTurnActive.compareAndSet(false, true)) {
-      "Cannot start turn: previous turn for model '${model.name}' is still in progress."
-    }
-
-    // Step 2: Synchronize session ID and turn counter from caller if provided, or continue
-    // from the previous turn in this session, or initialize turn 0 with a fresh UUID.
-    turnContext.updateAndGet { previous ->
-      TurnContext(
-        sessionId = sessionId ?: previous?.sessionId ?: UUID.randomUUID().toString(),
-        turnIndex = turnIndex ?: ((previous?.turnIndex ?: -1) + 1),
-      )
-    }
-
-    // Step 3: Start inference turn tracker and hardware sensor monitors if enabled.
-    inferenceTracker.startTurn(session = session)
-    if (memoryMonitor != null) memoryMonitor.start(scope)
-    if (powerMonitor != null) powerMonitor.start(scope)
+    memoryMonitor?.start(scope)
+    powerMonitor?.start(scope)
+    liveUpdateSampler?.start(scope)
+    emitLiveSnapshot()
   }
 
   override fun onNewToken(tokenText: String, thinkingText: String?) {
-    inferenceTracker.onNewToken(tokenText = tokenText, thinkingText = thinkingText)
+    inferenceTracker?.onNewToken(
+      tokenText = tokenText,
+      thinkingText = thinkingText,
+      onFirstToken = ::emitLiveSnapshot,
+    )
   }
 
-  override fun cancelTurn(reason: CancellationReason, customMessage: String?): InferenceMetrics =
+  override fun cancelTurn(reason: CancellationReason, customMessage: String?): InferenceMetrics? =
     endTurnInternal(
-      statusCode = InferenceStatus.Code.CANCELLED,
-      cancellationReason = reason,
-      errorMessage = customMessage,
+      status =
+        inferenceStatus {
+          this.code = InferenceStatus.Code.CANCELLED
+          if (reason != CancellationReason.CANCELLATION_REASON_UNSPECIFIED) {
+            this.cancellationReason = reason
+          }
+          if (!customMessage.isNullOrEmpty()) {
+            this.errorMessage = customMessage
+          }
+        }
     )
 
+  @Synchronized
   override fun resetSession() {
-    isTurnActive.set(false)
-    turnContext.set(null)
-    inferenceTracker.resetSession()
-    if (memoryMonitor != null) memoryMonitor.reset()
-    if (powerMonitor != null) powerMonitor.reset()
+    liveUpdateSampler?.stop()
+    refreshSessionTracker()
+    memoryMonitor?.reset()
+    powerMonitor?.reset()
+    emitLiveSnapshot()
   }
 
-  override fun endTurn(statusCode: InferenceStatus.Code, errorMessage: String?): InferenceMetrics =
+  override fun endTurn(statusCode: InferenceStatus.Code, errorMessage: String?): InferenceMetrics? =
     endTurnInternal(
-      statusCode = statusCode,
-      cancellationReason = CancellationReason.CANCELLATION_REASON_UNSPECIFIED,
-      errorMessage = errorMessage,
+      status =
+        inferenceStatus {
+          this.code = statusCode
+          if (!errorMessage.isNullOrEmpty()) {
+            this.errorMessage = errorMessage
+          }
+        }
     )
 
-  private fun endTurnInternal(
-    statusCode: InferenceStatus.Code,
-    cancellationReason: CancellationReason = CancellationReason.CANCELLATION_REASON_UNSPECIFIED,
-    errorMessage: String? = null,
-  ): InferenceMetrics {
-    // Step 1: Validate turn state and claim the active turn's correlation context.
-    check(isTurnActive.compareAndSet(true, false)) {
-      "Cannot end turn: No active turn in progress for model '${model.name}'."
-    }
-    val currentTurn = turnContext.get()
+  @Synchronized
+  override fun close() {
+    liveUpdateSampler?.stop()
+    memoryMonitor?.reset()
+    powerMonitor?.reset()
+    scope.cancel()
+  }
 
-    // Step 2: Finalize sensor measurements (process memory and battery power) if enabled.
-    val memoryMetrics =
-      if (memoryMonitor != null) memoryMonitor.stop() else MemoryMetrics.getDefaultInstance()
-    val batteryMetrics =
-      if (powerMonitor != null) powerMonitor.stop() else BatteryMetrics.getDefaultInstance()
-
-    // Step 3: Reconcile latency, token counts, and KV-cache context metrics from engine.
-    val turnMetrics = inferenceTracker.endTurn(status = statusCode)
-
-    // Step 4: Construct final immutable InferenceMetrics protobuf.
-    val finalMetrics = inferenceMetrics {
-      this.metadata = buildMetadata(currentTurn, statusCode, cancellationReason, errorMessage)
+  @Synchronized
+  private fun emitLiveSnapshot() {
+    if (!enableLiveMetrics) return
+    val turnMetrics = inferenceTracker?.buildLiveMetrics() ?: return
+    val isTurnActive = turnMetrics.status.code != InferenceStatus.Code.IDLE
+    _liveMetrics.value = inferenceMetrics {
+      this.metadata = this@LitertlmMetricsTracker.metadata
       this.inference = turnMetrics
-      this.memory = memoryMetrics
-      this.battery = batteryMetrics
+      this.memory =
+        if (isTurnActive) {
+          memoryMonitor?.buildMetrics() ?: MemoryMetrics.getDefaultInstance()
+        } else {
+          MemoryMetrics.getDefaultInstance()
+        }
+      this.battery =
+        if (isTurnActive) {
+          powerMonitor?.buildMetrics() ?: BatteryMetrics.getDefaultInstance()
+        } else {
+          BatteryMetrics.getDefaultInstance()
+        }
     }
+  }
 
-    // Step 5: Dispatch logs to ADB.
+  private fun emitLiveSnapshotIfTurnActive() {
+    if (inferenceTracker?.hasActiveTurn != true) return
+    synchronized(this) {
+      if (inferenceTracker?.hasActiveTurn != true) return
+      emitLiveSnapshot()
+    }
+  }
+
+  private fun endTurnInternal(status: InferenceStatus): InferenceMetrics? {
+    val finalMetrics =
+      synchronized(this) {
+        liveUpdateSampler?.stop()
+        val turnMetrics = inferenceTracker?.endTurn(status = status) ?: return null
+        val memoryMetrics = memoryMonitor?.stop() ?: MemoryMetrics.getDefaultInstance()
+        val batteryMetrics = powerMonitor?.stop() ?: BatteryMetrics.getDefaultInstance()
+        inferenceMetrics {
+            this.metadata = this@LitertlmMetricsTracker.metadata
+            this.inference = turnMetrics
+            this.memory = memoryMetrics
+            this.battery = batteryMetrics
+          }
+          .also {
+            if (enableLiveMetrics) {
+              _liveMetrics.value = it
+            }
+          }
+      }
     metricsLogger.logMetrics(finalMetrics)
     return finalMetrics
   }
 
-  private fun buildBaseMetadata(): InferenceMetadata {
+  private fun buildMetadata(): InferenceMetadata {
     return inferenceMetadata {
       this.modelName = model.name
       this.accelerator = model.currentAccelerator?.name ?: ""
       this.taskId = this@LitertlmMetricsTracker.taskId
       this.llmConfig = model.toLlmConfig()
-    }
-  }
-
-  private fun buildMetadata(
-    turnContext: TurnContext?,
-    statusCode: InferenceStatus.Code,
-    cancellationReason: CancellationReason = CancellationReason.CANCELLATION_REASON_UNSPECIFIED,
-    errorMessage: String? = null,
-  ): InferenceMetadata = baseMetadata.copy {
-    if (turnContext != null) {
-      if (turnContext.turnIndex >= 0) {
-        this.turnIndex = turnContext.turnIndex
-      }
-      this.sessionId = turnContext.sessionId
-    }
-    this.status = inferenceStatus {
-      this.code = statusCode
-      if (cancellationReason != CancellationReason.CANCELLATION_REASON_UNSPECIFIED) {
-        this.cancellationReason = cancellationReason
-      }
-      if (!errorMessage.isNullOrEmpty()) {
-        this.errorMessage = errorMessage
-      }
+      model.initDuration?.let { this.initDurationMs = it.inWholeMilliseconds }
     }
   }
 }
@@ -367,7 +430,11 @@ internal fun Model.toLlmConfig(): LlmConfig = llmConfig {
   this.defaultTopk = getIntConfigValue(ConfigKeys.TOPK, 0)
   this.defaultTopp = getFloatConfigValue(ConfigKeys.TOPP, 0.0f)
   this.defaultTemperature = getFloatConfigValue(ConfigKeys.TEMPERATURE, 0.0f)
-  this.defaultMaxTokens = getIntConfigValue(ConfigKeys.MAX_TOKENS, 0)
+  this.defaultMaxTokens =
+    getIntConfigValue(
+      key = ConfigKeys.MAX_TOKENS,
+      defaultValue = llmProfile?.maxTokens ?: DEFAULT_MAX_TOKEN,
+    )
   this.supportThinking = getBooleanConfigValue(ConfigKeys.ENABLE_THINKING, false)
   this.supportSpeculativeDecoding =
     getBooleanConfigValue(ConfigKeys.ENABLE_SPECULATIVE_DECODING, false)

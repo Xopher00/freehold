@@ -39,7 +39,7 @@ android {
     applicationId = "io.github.xopher00.freehold"
     minSdk = 31
     targetSdk = 37
-    versionCode = 45
+    versionCode = 46
     versionName = "1.0.20"
 
     // Needed for HuggingFace auth workflows.
@@ -131,6 +131,7 @@ android {
   packaging {
     // Compresses .so in the APK (~2.6:1); Android extracts them into nativeLibraryDir at install.
     jniLibs.useLegacyPackaging = true
+    jniLibs.pickFirsts.add("**/liblitertlm_jni.so")
     resources {
       pickFirsts += "META-INF/INDEX.LIST"
       pickFirsts += "META-INF/*.kotlin_module"
@@ -229,11 +230,14 @@ dependencies {
   implementation(libs.tink.android)
   implementation(libs.tasks.vision)
   implementation(libs.mlkit.text.recognition)
+  implementation(libs.tasks.retrieval)
+  implementation(libs.androidx.media3.exoplayer)
+  implementation(libs.androidx.media3.transformer)
+  implementation(libs.androidx.media3.ui)
+  implementation(libs.coil.compose)
 }
 
-configurations.all {
-  resolutionStrategy.force("org.jetbrains.kotlin:kotlin-metadata-jvm:2.4.0")
-}
+configurations.all { resolutionStrategy.force("org.jetbrains.kotlin:kotlin-metadata-jvm:2.4.0") }
 
 protobuf {
   protoc { artifact = "com.google.protobuf:protoc:4.26.1" }

@@ -8,7 +8,6 @@ import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.runtime.CleanUpListener
 import com.google.ai.edge.gallery.runtime.LlmModelHelper
 import com.google.ai.edge.gallery.runtime.ResultListener
-import com.google.ai.edge.gallery.runtime.StructuredOutputRequest
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.ToolProvider
@@ -29,7 +28,9 @@ object LiteRtLmEmbeddingModelHelper : LlmModelHelper {
     systemInstruction: Contents?,
     tools: List<ToolProvider>,
     enableConversationConstrainedDecoding: Boolean,
+    initialMessages: List<Message>,
     coroutineScope: CoroutineScope?,
+    enableResponseFormat: Boolean,
   ) {
     try {
       model.instance = LiteRtLmEmbedder.create(model.getPath(context))
@@ -47,6 +48,7 @@ object LiteRtLmEmbeddingModelHelper : LlmModelHelper {
     tools: List<ToolProvider>,
     enableConversationConstrainedDecoding: Boolean,
     initialMessages: List<Message>,
+    enableResponseFormat: Boolean,
   ) {}
 
   override fun cleanUp(model: Model, onDone: () -> Unit) {
@@ -64,11 +66,8 @@ object LiteRtLmEmbeddingModelHelper : LlmModelHelper {
     images: List<Bitmap>,
     audioClips: List<ByteArray>,
     coroutineScope: CoroutineScope?,
-    extraContext: Map<String, String>?,
-    sessionId: String?,
-    messageIndex: Int?,
-    maxOutputTokens: Int?,
-    responseFormat: StructuredOutputRequest?,
+    extraContext: Map<String, String>,
+    responseJsonSchema: String?,
   ) {
     onError(NOT_A_CHAT_MODEL)
   }

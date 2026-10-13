@@ -17,12 +17,17 @@
 package com.google.ai.edge.gallery.common
 
 import android.content.Context
+import android.content.res.AssetFileDescriptor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
+import android.os.ParcelFileDescriptor
 import android.util.Log
+import com.google.ai.edge.gallery.firebaseAnalytics
+import com.google.ai.edge.gallery.GalleryEvent
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.ime
 import androidx.compose.runtime.LaunchedEffect
@@ -42,6 +47,9 @@ import com.google.ai.edge.gallery.relay.security.OfflineMode
 import com.google.gson.Gson
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
@@ -140,14 +148,8 @@ fun convertWavToMonoWithMaxSeconds(
   Log.d(TAG, "Start to convert wav file to mono channel")
 
   try {
-    val inputStream =
-      (if (stereoUri.scheme == null || stereoUri.scheme == "file") {
-        FileInputStream(stereoUri.path ?: "")
-      } else {
-        context.contentResolver.openInputStream(stereoUri)
-      }) ?: return null
-    val originalBytes = inputStream.readBytes()
-    inputStream.close()
+    val originalBytes =
+      openSafeInputStream(context, stereoUri)?.use { it.readBytes() } ?: return null
 
     // Read WAV header
     if (originalBytes.size < 44) {
@@ -285,17 +287,56 @@ fun calculatePeakAmplitude(buffer: ByteArray, bytesRead: Int): Int {
   return maxAmplitude
 }
 
+fun openSafeInputStream(context: Context, uri: Uri): InputStream? {
+  return try {
+    if (uri.scheme == null || uri.scheme == "file") {
+      val path = uri.path?.takeIf { it.isNotEmpty() } ?: return null
+      return FileInputStream(File(path))
+    }
+    context.contentResolver.openInputStream(uri)
+  } catch (e: Exception) {
+    Log.e(TAG, "Failed to open input stream for URI: $uri", e)
+    null
+  }
+}
+
+fun openSafeOutputStream(context: Context, uri: Uri): OutputStream? {
+  return try {
+    if (uri.scheme == null || uri.scheme == "file") {
+      val path = uri.path?.takeIf { it.isNotEmpty() } ?: return null
+      return FileOutputStream(File(path))
+    }
+    context.contentResolver.openOutputStream(uri)
+  } catch (e: Exception) {
+    Log.e(TAG, "Failed to open output stream for URI: $uri", e)
+    null
+  }
+}
+
+fun openSafeAssetFileDescriptor(
+  context: Context,
+  uri: Uri,
+  mode: String = "r",
+): AssetFileDescriptor? {
+  return try {
+    if (uri.scheme == null || uri.scheme == "file") {
+      val path = uri.path?.takeIf { it.isNotEmpty() } ?: return null
+      val pfd = ParcelFileDescriptor.open(File(path), ParcelFileDescriptor.parseMode(mode))
+      return AssetFileDescriptor(pfd, 0, AssetFileDescriptor.UNKNOWN_LENGTH)
+    }
+    context.contentResolver.openAssetFileDescriptor(uri, mode)
+  } catch (e: Exception) {
+    Log.e(TAG, "Failed to open asset file descriptor for URI: $uri", e)
+    null
+  }
+}
+
 fun decodeSampledBitmapFromUri(context: Context, uri: Uri, reqWidth: Int, reqHeight: Int): Bitmap? {
   // First, decode with inJustDecodeBounds=true to check dimensions
   val options =
     BitmapFactory.Options().apply {
       inJustDecodeBounds = true
-      (if (uri.scheme == null || uri.scheme == "file") {
-          FileInputStream(uri.path ?: "")
-        } else {
-          context.contentResolver.openInputStream(uri)
-        })
-        ?.use { BitmapFactory.decodeStream(it, null, this) }
+      openSafeInputStream(context, uri)?.use { BitmapFactory.decodeStream(it, null, this) }
 
       // Calculate inSampleSize
       inSampleSize = calculateInSampleSize(this, reqWidth, reqHeight)
@@ -304,12 +345,7 @@ fun decodeSampledBitmapFromUri(context: Context, uri: Uri, reqWidth: Int, reqHei
       inJustDecodeBounds = false
     }
 
-  return (if (uri.scheme == null || uri.scheme == "file") {
-      FileInputStream(uri.path ?: "")
-    } else {
-      context.contentResolver.openInputStream(uri)
-    })
-    ?.use { BitmapFactory.decodeStream(it, null, options) }
+  return openSafeInputStream(context, uri)?.use { BitmapFactory.decodeStream(it, null, options) }
 }
 
 fun rotateBitmap(bitmap: Bitmap, orientation: Int): Bitmap {
@@ -442,6 +478,38 @@ fun isAICoreSupported(allowedDeviceModels: Set<String>?): Boolean {
   return supported
 }
 
+fun logErrorToFirebase(event: GalleryEvent, errorType: String, errorMessage: String?) {
+  firebaseAnalytics?.logEvent(
+    event.id,
+    Bundle().apply {
+      putBoolean("success", false)
+      putString("error_type", errorType)
+      putString("error_message", errorMessage ?: "Unknown error")
+    },
+  )
+}
+
+/**
+ * Reports a button press to Firebase as a [GalleryEvent.BUTTON_CLICKED] event.
+ *
+ * [eventType] identifies the button and must be unique per button, so that two different buttons
+ * are never distinguished by their parameters alone. Pass [buttonId] only for a single button that
+ * carries a value, such as one segment of a segmented button. Use [extras] to report any further
+ * parameters describing the press; it cannot overwrite the two keys above, which are always written
+ * last.
+ */
+fun logButtonClick(eventType: String, buttonId: String? = null, extras: Bundle.() -> Unit = {}) {
+  firebaseAnalytics?.logEvent(
+    GalleryEvent.BUTTON_CLICKED.id,
+    Bundle().apply {
+      extras()
+      putString("event_type", eventType)
+      buttonId?.let { putString("button_id", it) }
+    },
+  )
+}
+
+
 fun convertStringToJsonObject(jsonString: String): JsonObject {
   return try {
     lenientJson.parseToJsonElement(jsonString).jsonObject
@@ -449,4 +517,25 @@ fun convertStringToJsonObject(jsonString: String): JsonObject {
     Log.w(TAG, "Could not parse JSON string; using an empty object", e)
     JsonObject(emptyMap())
   }
+}
+
+/**
+ * Listener for virtual-device permission request results dispatched via
+ * `Activity.requestPermissions`.
+ */
+@Suppress("KotlinArray")
+fun interface PermissionsResultListener {
+  fun onPermissionsResult(
+    requestCode: Int,
+    permissions: Array<out String>,
+    grantResults: IntArray,
+    deviceId: Int,
+  )
+}
+
+/** Host activity interface for observing virtual-device permission results. */
+interface VirtualDevicePermissionsHost {
+  fun registerPermissionsResultListener(listener: PermissionsResultListener)
+
+  fun unregisterPermissionsResultListener(listener: PermissionsResultListener)
 }

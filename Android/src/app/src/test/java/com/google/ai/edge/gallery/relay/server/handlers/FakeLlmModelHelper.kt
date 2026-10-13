@@ -12,7 +12,6 @@ import com.google.ai.edge.gallery.relay.runtime.TurnUsageStore
 import com.google.ai.edge.gallery.runtime.CleanUpListener
 import com.google.ai.edge.gallery.runtime.LlmModelHelper
 import com.google.ai.edge.gallery.runtime.ResultListener
-import com.google.ai.edge.gallery.runtime.StructuredOutputRequest
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.ToolProvider
@@ -26,6 +25,9 @@ internal class FakeLlmModelHelper(
   private val deltas: List<String>,
   private val completionTokens: Int,
 ) : LlmModelHelper {
+  var lastExtraContext: Map<String, String>? = null
+  var lastResponseJsonSchema: String? = null
+
   override fun initialize(
     context: Context,
     model: Model,
@@ -36,7 +38,9 @@ internal class FakeLlmModelHelper(
     systemInstruction: Contents?,
     tools: List<ToolProvider>,
     enableConversationConstrainedDecoding: Boolean,
+    initialMessages: List<Message>,
     coroutineScope: CoroutineScope?,
+    enableResponseFormat: Boolean,
   ) {}
 
   override fun resetConversation(
@@ -47,6 +51,7 @@ internal class FakeLlmModelHelper(
     tools: List<ToolProvider>,
     enableConversationConstrainedDecoding: Boolean,
     initialMessages: List<Message>,
+    enableResponseFormat: Boolean,
   ) {}
 
   override fun cleanUp(model: Model, onDone: () -> Unit) {}
@@ -60,12 +65,11 @@ internal class FakeLlmModelHelper(
     images: List<Bitmap>,
     audioClips: List<ByteArray>,
     coroutineScope: CoroutineScope?,
-    extraContext: Map<String, String>?,
-    sessionId: String?,
-    messageIndex: Int?,
-    maxOutputTokens: Int?,
-    responseFormat: StructuredOutputRequest?,
+    extraContext: Map<String, String>,
+    responseJsonSchema: String?,
   ) {
+    lastExtraContext = extraContext
+    lastResponseJsonSchema = responseJsonSchema
     for (delta in deltas) resultListener(delta, false, null)
     TurnUsageStore.record(
       model.name,

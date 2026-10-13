@@ -116,6 +116,9 @@ constructor(
   val allowlistModels: List<Model>
     get() = modelAllowlistLoader.allowlistModels
 
+  val loadedFromTestAllowlist: Boolean
+    get() = modelAllowlistLoader.loadedFromTestAllowlist
+
   fun groupTasksByCategory(): Map<String, List<Task>> = modelAllowlistLoader.groupTasksByCategory()
 
   fun getModelDownloadStatus(model: Model): ModelDownloadStatus =

@@ -21,6 +21,7 @@ import android.util.Log
 import com.google.ai.edge.gallery.agent.sessions.LlmSessionManager
 import com.google.ai.edge.gallery.agent.sessions.SessionConfig
 import com.google.ai.edge.gallery.agent.sessions.generateSessionId
+import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.runtime.runtimeHelper
 import com.google.ai.edge.gallery.skills.SkillsProvider
 import com.google.ai.edge.gallery.tools.ToolDispatcher
@@ -90,6 +91,7 @@ open class DefaultAgentRuntimeExecutor(
         supportAudio = config.supportAudio,
         systemInstruction = effectiveSystemInstruction,
         tools = toolsProvider.getLiteRtToolProviders(),
+        enableConversationConstrainedDecoding = config.enableConversationConstrainedDecoding,
       )
 
     activeSession.set(
@@ -101,24 +103,38 @@ open class DefaultAgentRuntimeExecutor(
       context = executionContext,
     )
 
+    val wasModelInitialized =
+      config.model.initStatusFlow.value is Model.InitializationStatus.Initialized
+
     config.model.runtimeHelper.initialize(
       context = context,
       model = config.model,
       taskId = config.taskId,
       supportImage = config.supportImage,
       supportAudio = config.supportAudio,
-      onDone = onDone,
+      onDone = { error ->
+        if (
+          !wasModelInitialized &&
+            config.model.initStatusFlow.value is Model.InitializationStatus.Initialized
+        ) {
+          llmSessionManager.setSessionConfig(sessionId = effectiveSessionId, config = sessionConfig)
+        }
+        onDone(error)
+      },
       systemInstruction = effectiveSystemInstruction,
       tools = toolsProvider.getLiteRtToolProviders(),
       enableConversationConstrainedDecoding = config.enableConversationConstrainedDecoding,
+      initialMessages = config.initialMessages,
     )
 
-    llmSessionManager.resetSession(
-      sessionId = effectiveSessionId,
-      config = sessionConfig,
-      initialMessages = config.initialMessages,
-      enableConversationConstrainedDecoding = config.enableConversationConstrainedDecoding,
-    )
+    if (wasModelInitialized) {
+      llmSessionManager.resetSession(
+        sessionId = effectiveSessionId,
+        config = sessionConfig,
+        initialMessages = config.initialMessages,
+        enableConversationConstrainedDecoding = config.enableConversationConstrainedDecoding,
+      )
+    }
   }
 
   private fun ProducerScope<AgentEvent>.emitEvent(event: AgentEvent) {
@@ -154,7 +170,6 @@ open class DefaultAgentRuntimeExecutor(
       (request.metadata[AgentRequest.SESSION_ID] as? String)
         ?: llmSessionManager.activeSessionId
         ?: error("No active session in LlmSessionManager")
-    val messageIndex = request.metadata[AgentRequest.MESSAGE_INDEX] as? Int
 
     val resultListener = { partialResult: String, done: Boolean, partialThinking: String? ->
       if (!partialResult.startsWith("<ctrl")) {
@@ -203,7 +218,6 @@ open class DefaultAgentRuntimeExecutor(
       images = images,
       audioClips = audioClips,
       extraContext = extraContext,
-      messageIndex = messageIndex,
     )
 
     awaitClose {
@@ -257,6 +271,7 @@ open class DefaultAgentRuntimeExecutor(
         supportAudio = config.supportAudio,
         systemInstruction = effectiveSystemInstruction,
         tools = toolsProvider.getLiteRtToolProviders(),
+        enableConversationConstrainedDecoding = config.enableConversationConstrainedDecoding,
       )
 
     activeSession.set(

@@ -19,6 +19,7 @@ package com.google.ai.edge.gallery.ui.modelmanager
 import android.content.Context
 import android.util.Log
 import androidx.activity.result.ActivityResult
+import androidx.annotation.VisibleForTesting
 import androidx.core.net.toUri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -41,6 +42,8 @@ import com.google.ai.edge.gallery.data.DataStoreRepository
 import com.google.ai.edge.gallery.data.DownloadRepository
 import com.google.ai.edge.gallery.data.EMPTY_MODEL
 import com.google.ai.edge.gallery.data.IMPORTS_DIR
+import com.google.ai.edge.gallery.data.LiteRtLmModelDownloader
+import com.google.ai.edge.gallery.data.LlmProfile
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.data.ModelAccessibility
 import com.google.ai.edge.gallery.data.ModelAllowlist
@@ -48,8 +51,12 @@ import com.google.ai.edge.gallery.data.ModelCapability
 import com.google.ai.edge.gallery.data.ModelDownloadInfo
 import com.google.ai.edge.gallery.data.ModelDownloadStatus
 import com.google.ai.edge.gallery.data.ModelDownloadStatusType
+import com.google.ai.edge.gallery.data.ModelDownloader
 import com.google.ai.edge.gallery.data.ModelFile
+import com.google.ai.edge.gallery.data.ModelType
+import com.google.ai.edge.gallery.data.ModelUtils
 import com.google.ai.edge.gallery.data.NumberSliderConfig
+import com.google.ai.edge.gallery.data.RuntimeType
 import com.google.ai.edge.gallery.data.SOC
 import com.google.ai.edge.gallery.data.SystemPromptRepository
 import com.google.ai.edge.gallery.data.TMP_FILE_EXT
@@ -70,19 +77,24 @@ import com.google.ai.edge.gallery.proto.AccessTokenData
 import com.google.ai.edge.gallery.proto.HfModelItemProto
 import com.google.ai.edge.gallery.proto.ImportedModel
 import com.google.ai.edge.gallery.proto.Theme
-import com.google.ai.edge.gallery.runtime.aicore.AICoreModelHelper
+import com.google.ai.edge.gallery.runtime.aicore.AICoreModelDownloader
 import com.google.ai.edge.litertlm.Contents
 import com.google.gson.Gson
-import com.google.gson.JsonSyntaxException
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import javax.inject.Inject
 import kotlin.collections.sortedWith
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -96,13 +108,22 @@ import net.openid.appauth.ResponseTypeValues
 private const val TAG = "AGModelManagerViewModel"
 private const val TEXT_INPUT_HISTORY_MAX_SIZE = 50
 private const val MODEL_ALLOWLIST_FILENAME = "model_allowlist.json"
-private const val MODEL_ALLOWLIST_TEST_FILENAME = "model_allowlist_test.json"
 private const val ALLOWLIST_BASE_URL =
   "https://raw.githubusercontent.com/google-ai-edge/gallery/refs/heads/main/model_allowlists"
 private const val PLACEHOLDER_FILENAME = "placeholder"
 private const val UNPACKED_FILE_EXT = "unpacked"
 
-private const val TEST_MODEL_ALLOW_LIST = ""
+/**
+ * Location of an optional local model allowlist used for testing.
+ *
+ * When this file exists, it takes precedence over the allowlist fetched from the network, e.g.:
+ * ```
+ * adb push dev.json /data/local/tmp/model_allowlist_test.json
+ * ```
+ *
+ * Delete the file to go back to the regular allowlist.
+ */
+const val MODEL_ALLOWLIST_TEST_FILE_PATH = "/data/local/tmp/model_allowlist_test.json"
 
 enum class TokenStatus {
   NOT_STORED,
@@ -136,6 +157,12 @@ data class ModelManagerUiState(
   /** The error message when loading the model allowlist. */
   val loadingModelAllowlistError: String = "",
 
+  /**
+   * Whether to show a warning that the model allowlist was loaded from the local test file at
+   * [MODEL_ALLOWLIST_TEST_FILE_PATH] instead of the regular source.
+   */
+  val showLocalTestAllowlistDialog: Boolean = false,
+
   /** The currently selected model. */
   val selectedModel: Model = EMPTY_MODEL,
 
@@ -156,6 +183,9 @@ data class ModelManagerUiState(
 
   /** A map that tracks the download status of optional extra data files, indexed by model name. */
   val extraDataDownloadStatus: Map<String, ModelDownloadStatus> = mapOf(),
+
+  /** Supplementary models that are not bound to a specific task. */
+  val supplementaryModels: List<Model> = emptyList(),
 ) {
   fun isDownloadOptionalComponentsEnabled(modelName: String): Boolean {
     return downloadOptionalComponents[modelName] ?: true
@@ -176,6 +206,8 @@ private val RESET_CONVERSATION_TURN_COUNT_CONFIG =
   )
 private val PREDEFINED_LLM_TASK_ORDER =
   listOf(
+    BuiltInTaskId.SMART_ALBUM,
+    BuiltInTaskId.VIDEO_MOMENT_FINDER,
     BuiltInTaskId.LLM_CHAT,
     BuiltInTaskId.LLM_AGENT_CHAT,
     BuiltInTaskId.LLM_ASK_IMAGE,
@@ -205,13 +237,21 @@ constructor(
   val huggingFaceApiClient: HuggingFaceApiClient,
   private val deviceProfile: DeviceProfile,
   @ApplicationContext private val context: Context,
+  protected val downloaders: Map<RuntimeType, @JvmSuppressWildcards ModelDownloader>,
 ) :
   ViewModel()
 {
-
   private val modelsDir = getModelStorageDir(context)
-  protected val _uiState = MutableStateFlow(createEmptyUiState())
-  open val uiState = _uiState.asStateFlow()
+
+  /** Local test allowlist; see [MODEL_ALLOWLIST_TEST_FILE_PATH]. Overridden in tests. */
+  @VisibleForTesting internal var localTestAllowlistFile = File(MODEL_ALLOWLIST_TEST_FILE_PATH)
+
+  /** Dispatcher that [loadModelAllowlist] runs on. Overridden in tests to load synchronously. */
+  @VisibleForTesting internal var allowlistLoadingDispatcher: CoroutineDispatcher = Dispatchers.IO
+
+  protected val _uiState: MutableStateFlow<ModelManagerUiState> =
+    MutableStateFlow(createEmptyUiState())
+  open val uiState: StateFlow<ModelManagerUiState> = _uiState.asStateFlow()
 
   open fun fetchModelDetails(modelId: String, onResult: (HfModelItemProto?) -> Unit) {
     viewModelScope.launch {
@@ -231,9 +271,14 @@ constructor(
   // same state without an Activity. Google's own fields below stay in place, unread.
   private var _allowlistModels: MutableList<Model> = mutableListOf()
   val allowlistModels: List<Model>
-    get() = modelRegistry.allowlistModels
+    get() =
+      modelRegistry.allowlistModels.filter {
+        !it.isSupplementary || downloaders[it.backendSpec.runtimeType] != null
+      }
 
   private val initializedBackends = mutableMapOf<String, MutableSet<String>>()
+
+  protected val _supplementaryModels: MutableList<Model> = CopyOnWriteArrayList()
 
   fun isFirstInitialization(model: Model): Boolean = modelRegistry.isFirstInitialization(model)
 
@@ -289,7 +334,7 @@ constructor(
         }
       }
     }
-    return null
+    return uiState.value.supplementaryModels.find { it.name == name }
   }
 
   fun getAllModels(): List<Model> {
@@ -357,60 +402,27 @@ constructor(
       status = ModelDownloadStatus(status = ModelDownloadStatusType.IN_PROGRESS),
     )
 
-    if (model.isAiCore) {
-      AICoreModelHelper.downloadModel(
-        context = context,
-        coroutineScope = viewModelScope,
+    if (model.downloadsViaRepository) {
+      // Delete the model files first.
+      deleteModel(
         model = model,
-        onProgress = { downloaded: Long, total: Long ->
-          setDownloadStatus(
-            curModel = model,
-            status =
-              ModelDownloadStatus(
-                status = ModelDownloadStatusType.IN_PROGRESS,
-                receivedBytes = downloaded,
-                totalBytes = total,
-              ),
-          )
-        },
-        onDone = {
-          setDownloadStatus(
-            curModel = model,
-            status =
-              ModelDownloadStatus(
-                status = ModelDownloadStatusType.SUCCEEDED,
-                receivedBytes = model.downloadInfo.sizeInBytes,
-                totalBytes = model.downloadInfo.sizeInBytes,
-              ),
-          )
-        },
-        onError = { error: String ->
-          setDownloadStatus(
-            curModel = model,
-            status =
-              ModelDownloadStatus(status = ModelDownloadStatusType.FAILED, errorMessage = error),
-          )
-        },
+        removeImportedFromModelList = false,
+        preserveOptionalComponentsState = true,
       )
-      return
     }
-
-    // Delete the model files first.
-    deleteModel(
-      model = model,
-      removeImportedFromModelList = false,
-      preserveOptionalComponentsState = true,
-    )
 
     val family = getModelFamily(model)
     val isExtraDataAlreadyDownloaded =
-      family.any {
-        uiState.value.extraDataDownloadStatus[it.name]?.status == ModelDownloadStatusType.SUCCEEDED
-      } || family.any { isExtraDataPresentOnDisk(it, task?.id) }
+      model.downloadsViaRepository &&
+        (family.any {
+          uiState.value.extraDataDownloadStatus[it.name]?.status ==
+            ModelDownloadStatusType.SUCCEEDED
+        } || family.any { isExtraDataPresentOnDisk(it, task?.id) })
     val actualIncludeExtraDataFiles = includeExtraDataFiles && !isExtraDataAlreadyDownloaded
 
-    // Start to send download request.
-    downloadRepository.downloadModel(
+    val downloader =
+      downloaders[model.backendSpec.runtimeType] ?: downloaders[RuntimeType.LITERT_LM]
+    downloader?.download(
       task = task,
       model = model,
       includeExtraDataFiles = actualIncludeExtraDataFiles,
@@ -430,12 +442,21 @@ constructor(
   }
 
   fun cancelDownloadModel(model: Model) {
-    // AICore models cannot be deleted from the download repository within the app.
-    if (model.isAiCore) {
+    val downloader =
+      downloaders[model.backendSpec.runtimeType] ?: downloaders[RuntimeType.LITERT_LM]
+    // The download keeps running, so leave its status alone rather than report it cancelled.
+    if (downloader?.supportsCancel == false) {
       return
     }
-    downloadRepository.cancelDownloadModel(model)
-    deleteModel(model = model, removeImportedFromModelList = false)
+    downloader?.cancel(model)
+    if (model.downloadsViaRepository) {
+      deleteModel(model = model, removeImportedFromModelList = false)
+    } else {
+      setDownloadStatus(
+        curModel = model,
+        status = ModelDownloadStatus(status = ModelDownloadStatusType.NOT_DOWNLOADED),
+      )
+    }
   }
 
   private fun isExtraDataPresentOnDisk(model: Model, taskId: String? = null): Boolean {
@@ -696,10 +717,20 @@ constructor(
       }
     }
 
-    if (model.downloadInfo.imported) {
-      deleteFilesFromImportDir(model.downloadInfo.downloadFileName)
+    if (model.downloadsViaRepository) {
+      if (model.downloadInfo.imported) {
+        deleteFilesFromImportDir(model.downloadInfo.downloadFileName)
+      } else {
+        deleteDirFromModelsDir(model.normalizedName)
+      }
     } else {
-      deleteDirFromModelsDir(model.normalizedName)
+      val downloader = downloaders[model.backendSpec.runtimeType]
+      if (downloader != null) {
+        viewModelScope.launch {
+          downloader.delete(model)
+          setDownloadStatus(curModel = model, status = downloader.queryStatus(model))
+        }
+      }
     }
 
     initializedBackends.remove(model.name)
@@ -797,13 +828,14 @@ constructor(
   fun setDownloadStatus(curModel: Model, status: ModelDownloadStatus) {
     // Delete downloaded file if status is failed or not_downloaded.
     if (
-      status.status == ModelDownloadStatusType.FAILED ||
-        status.status == ModelDownloadStatusType.NOT_DOWNLOADED
+      curModel.downloadsViaRepository &&
+        (status.status == ModelDownloadStatusType.FAILED ||
+          status.status == ModelDownloadStatusType.NOT_DOWNLOADED)
     ) {
       deleteFileFromModelsDir(curModel.downloadInfo.downloadFileName)
     }
 
-    if (status.status == ModelDownloadStatusType.SUCCEEDED) {
+    if (curModel.downloadsViaRepository && status.status == ModelDownloadStatusType.SUCCEEDED) {
       syncExtraDataAcrossFamily(curModel)
       val family = getModelFamily(curModel)
       if (
@@ -1129,13 +1161,16 @@ constructor(
     dataStoreRepository.clearAccessTokenData()
   }
 
-  private fun checkAICoreModelStatuses() {
-    viewModelScope.launch(Dispatchers.Main) {
-      val aicoreModels =
-        uiState.value.tasks.flatMap { it.models }.filter { it.isAiCore }.distinctBy { it.name }
+  private fun startAutoDownloadModels() {
+    viewModelScope.launch {
+      val autoDownloadModels =
+        uiState.value.tasks
+          .flatMap { it.models }
+          .filter { it.autoDownloadsOnStartup }
+          .distinctBy { it.name }
 
-      // Proactively attempt AICore model download upon app startup.
-      for (model in aicoreModels) {
+      // Proactively attempt auto-download model initialization/download upon app startup.
+      for (model in autoDownloadModels) {
         downloadModel(task = null, model = model)
       }
     }
@@ -1190,16 +1225,24 @@ constructor(
       onDone = {
         viewModelScope.launch(Dispatchers.IO) {
           val curTasks = getActiveCustomTasks().map { it.task }
+          _supplementaryModels.clear()
+          _supplementaryModels.addAll(
+            modelRegistry.allowlistModels.filter {
+              it.isSupplementary && downloaders[it.backendSpec.runtimeType] != null
+            }
+          )
           _uiState.update {
             createUiState()
               .copy(
                 loadingModelAllowlist = false,
                 tasks = curTasks,
                 tasksByCategory = groupTasksByCategory(),
+                showLocalTestAllowlistDialog = modelRegistry.loadedFromTestAllowlist,
               )
           }
           processPendingDownloads()
-          checkAICoreModelStatuses()
+          startAutoDownloadModels()
+          refreshSupplementaryStatuses()
           Log.d(TAG, "loadModelAllowlist: Done")
         }
       },
@@ -1209,6 +1252,34 @@ constructor(
         }
       },
     )
+  }
+
+  /** Queries and updates the download/availability status of all loaded supplementary models. */
+  fun refreshSupplementaryStatuses() {
+    viewModelScope.launch {
+      // Query all statuses concurrently, then apply them in allowlist order.
+      val pendingStatuses = _supplementaryModels.mapNotNull { model ->
+        val downloader = downloaders[model.backendSpec.runtimeType] ?: return@mapNotNull null
+        model to
+          async {
+            try {
+              downloader.queryStatus(model)
+            } catch (e: CancellationException) {
+              throw e
+            } catch (e: Exception) {
+              Log.w(TAG, "Failed to query status for supplementary model '${model.name}'", e)
+              ModelDownloadStatus(
+                status = ModelDownloadStatusType.FAILED,
+                errorMessage = e.localizedMessage.orEmpty(),
+              )
+            }
+          }
+      }
+      for ((model, pendingStatus) in pendingStatuses) {
+        val status = pendingStatus.await()
+        setDownloadStatus(curModel = model, status = status)
+      }
+    }
   }
 
   fun clearLoadModelAllowlistError() {
@@ -1227,6 +1298,11 @@ constructor(
     }
   }
 
+  /** Dismisses the warning shown when the model allowlist is loaded from the local test file. */
+  fun dismissLocalTestAllowlistDialog() {
+    _uiState.update { it.copy(showLocalTestAllowlistDialog = false) }
+  }
+
   fun setAppInForeground(foreground: Boolean) {
     lifecycleProvider.isAppInForeground = foreground
   }
@@ -1243,13 +1319,10 @@ constructor(
   }
 
   private fun readModelAllowlistFromDisk(
-    fileName: String = MODEL_ALLOWLIST_FILENAME
+    file: File = File(modelsDir, MODEL_ALLOWLIST_FILENAME)
   ): ModelAllowlist? {
     try {
-      Log.d(TAG, "Reading model allowlist from disk: $fileName")
-      val baseDir =
-        if (fileName == MODEL_ALLOWLIST_TEST_FILENAME) File("/data/local/tmp") else modelsDir
-      val file = File(baseDir, fileName)
+      Log.d(TAG, "Reading model allowlist from disk: ${file.absolutePath}")
       if (file.exists()) {
         val content = file.readText()
         Log.d(TAG, "Model allowlist content from local file: $content")
@@ -1316,6 +1389,16 @@ constructor(
       }
     }
 
+    for (suppModel in _supplementaryModels) {
+      modelDownloadStatus[suppModel.name] =
+        _uiState.value.modelDownloadStatus[suppModel.name]
+          ?: if (suppModel.downloadsViaRepository) {
+            getModelDownloadStatus(model = suppModel)
+          } else {
+            ModelDownloadStatus(status = ModelDownloadStatusType.NOT_DOWNLOADED)
+          }
+    }
+
     // relay: ModelRegistry attaches imported models to their tasks idempotently, so a
     // BootReceiver-driven restore and this Activity-driven one cannot double-add. Google's own
     // attach code is superseded by it; only the download-status mapping stays here.
@@ -1358,6 +1441,7 @@ constructor(
       textInputHistory = textInputHistory,
       downloadOptionalComponents = _uiState.value.downloadOptionalComponents,
       extraDataDownloadStatus = extraDataDownloadStatus,
+      supplementaryModels = _supplementaryModels.toList(),
     )
   }
 

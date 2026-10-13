@@ -18,6 +18,7 @@ package com.google.ai.edge.gallery.ui.common.chat
 
 import android.graphics.Bitmap
 import android.util.Log
+import androidx.annotation.StringRes
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.ui.graphics.ImageBitmap
@@ -27,6 +28,7 @@ import com.google.ai.edge.gallery.common.Classification
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.data.PromptTemplate
 import com.google.ai.edge.litertlm.Message
+import java.util.UUID
 import kotlinx.coroutines.sync.Mutex
 
 private const val TAG = "AGChatMessage"
@@ -48,6 +50,7 @@ enum class ChatMessageType {
   WEBVIEW,
   COLLAPSABLE_PROGRESS_PANEL,
   THINKING,
+  DIVIDER,
 }
 
 enum class ChatSide {
@@ -64,6 +67,7 @@ open class ChatMessage(
   open val accelerator: String = "",
   open val hideSenderLabel: Boolean = false,
   open val disableBubbleShape: Boolean = false,
+  open val id: String = UUID.randomUUID().toString(),
 ) {
 
   open fun clone(): ChatMessage {
@@ -75,6 +79,7 @@ open class ChatMessage(
         accelerator = accelerator,
         hideSenderLabel = hideSenderLabel,
         disableBubbleShape = disableBubbleShape,
+        id = id,
       )
     return cloned
   }
@@ -109,6 +114,14 @@ class ChatMessageConfigValuesChange(
   val newValues: Map<String, Any>,
 ) : ChatMessage(type = ChatMessageType.CONFIG_VALUES_CHANGE, side = ChatSide.SYSTEM)
 
+/** Chat message for showing a horizontal divider with centered text. */
+class ChatMessageDivider(@StringRes val textResId: Int = 0, val text: String = "") :
+  ChatMessage(type = ChatMessageType.DIVIDER, side = ChatSide.SYSTEM) {
+  override fun clone(): ChatMessageDivider {
+    return ChatMessageDivider(textResId = textResId, text = text)
+  }
+}
+
 /** Chat message for plain text. */
 open class ChatMessageText(
   val content: String,
@@ -122,6 +135,7 @@ open class ChatMessageText(
   override val accelerator: String = "",
   override val hideSenderLabel: Boolean = false,
   var data: Any? = null,
+  override val id: String = UUID.randomUUID().toString(),
 ) :
   ChatMessage(
     type = ChatMessageType.TEXT,
@@ -129,6 +143,7 @@ open class ChatMessageText(
     latencyMs = latencyMs,
     accelerator = accelerator,
     hideSenderLabel = hideSenderLabel,
+    id = id,
   ) {
   override fun clone(): ChatMessageText {
     val cloned =
@@ -141,6 +156,7 @@ open class ChatMessageText(
         llmBenchmarkResult = llmBenchmarkResult,
         hideSenderLabel = hideSenderLabel,
         data = data,
+        id = id,
       )
     return cloned
   }

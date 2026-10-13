@@ -28,6 +28,7 @@ import com.google.ai.edge.gallery.relay.runtime.TurnTokenUsage
 import com.google.ai.edge.gallery.relay.runtime.TurnUsageStore
 import com.google.ai.edge.gallery.relay.runtime.llamacpp.LlamaCppEngine
 import com.google.ai.edge.gallery.relay.runtime.llamacpp.LlamaCppModelHelper
+import com.google.ai.edge.gallery.relay.runtime.maxOutputTokensExtraContext
 import com.google.ai.edge.gallery.runtime.LlmModelHelper
 import com.google.ai.edge.gallery.runtime.runtimeHelper
 import io.ktor.http.HttpStatusCode
@@ -228,8 +229,7 @@ internal suspend fun collectInferenceStream(
         images = images,
         audioClips = emptyList(),
         coroutineScope = CoroutineScope(Dispatchers.Default),
-        extraContext = null,
-        maxOutputTokens = maxOutputTokens,
+        extraContext = maxOutputTokensExtraContext(maxOutputTokens),
     )
 
     // A client disconnect throws CancellationException out of events.receive(); finally still
