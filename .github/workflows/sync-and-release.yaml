@@ -40,7 +40,7 @@ jobs:
         working-directory: ./Android/src
     steps:
       - name: Checkout main (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0

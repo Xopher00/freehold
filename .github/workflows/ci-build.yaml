@@ -23,7 +23,7 @@ jobs:
         working-directory: ./Android/src
     steps:
       - name: Checkout the source code (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 0
@@ -72,7 +72,7 @@ jobs:
       # keystore.properties is gitignored and absent in CI, so the build falls
       # back to debug signing on its own; no secrets needed here.
       - name: Upload APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gallery-fork-release-apk
           path: Android/src/app/build/outputs/apk/release/*.apk
