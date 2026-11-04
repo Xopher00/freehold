@@ -41,7 +41,8 @@ class ModelFiles(private val context: Context, private val modelsDir: File) {
 
     val tmpFilePath =
       model.getPath(context = context, fileName = "${model.downloadInfo.downloadFileName}.$TMP_FILE_EXT")
-    return File(tmpFilePath).exists()
+    // An empty tmp file is left when a download stopped before receiving anything: not downloaded.
+    return File(tmpFilePath).length() > 0L
   }
 
   private fun getModelDownloadStatus(

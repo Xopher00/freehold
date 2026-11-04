@@ -98,7 +98,6 @@ import com.google.ai.edge.gallery.data.OssModelImportLogger
 import com.google.ai.edge.gallery.data.Task
 import com.google.ai.edge.gallery.data.supportModelBenchmark
 import com.google.ai.edge.gallery.relay.Flags
-import com.google.ai.edge.gallery.relay.device.DeviceProfileEntryPoint
 import com.google.ai.edge.gallery.huggingface.heuristics.isKnownPublisherNamespace
 import com.google.ai.edge.gallery.huggingface.extractHfUrlInfo
 import com.google.ai.edge.gallery.proto.HfModelItemProto
@@ -106,9 +105,7 @@ import com.google.ai.edge.gallery.proto.ImportedModel
 import com.google.ai.edge.gallery.ui.common.TaskIcon
 import com.google.ai.edge.gallery.ui.common.isHttpOrHttps
 import com.google.ai.edge.gallery.ui.common.modelitem.ModelItem
-import com.google.ai.edge.gallery.ui.common.storage.StorageWarningDialog
 import com.google.ai.edge.gallery.ui.common.tos.TosViewModel
-import dagger.hilt.android.EntryPointAccessors
 import kotlin.text.endsWith
 import kotlin.text.lowercase
 import kotlinx.coroutines.delay
@@ -173,14 +170,6 @@ fun GlobalModelManager(
   var isLoadingModelCardDetails by remember { mutableStateOf(false) }
   val scope = rememberCoroutineScope()
   val context = LocalContext.current
-  // Plain @Singleton, not a ViewModel -- no hiltViewModel() entry point for it here.
-  val deviceProfile = remember(context) {
-    EntryPointAccessors.fromApplication(
-        context.applicationContext,
-        DeviceProfileEntryPoint::class.java,
-      )
-      .deviceProfile()
-  }
   val snackbarHostState = remember { SnackbarHostState() }
   val modelItemExpandedStates = remember { mutableStateMapOf<String, Boolean>() }
   var selectedTab by remember { mutableStateOf(ModelManagerTab.MAIN) }
@@ -758,21 +747,6 @@ fun GlobalModelManager(
               ),
           )
       },
-    )
-  }
-
-  // Storage warning for a download auto-started outside DownloadAndTryButton (imported model
-  // discovery), gated at the ModelManagerViewModel.downloadModel choke point.
-  val storageConfirmationModel =
-    uiState.modelNeedingStorageConfirmation?.let { viewModel.getModelByName(it) }
-  if (storageConfirmationModel != null) {
-    StorageWarningDialog(
-      requiredBytes = storageConfirmationModel.downloadInfo.totalBytes,
-      freeBytes = deviceProfile.freeStorageBytes(),
-      onProceedAnyway = {
-        viewModel.proceedWithDownloadDespiteStorageWarning(model = storageConfirmationModel)
-      },
-      onDismiss = { viewModel.dismissStorageConfirmation() },
     )
   }
 

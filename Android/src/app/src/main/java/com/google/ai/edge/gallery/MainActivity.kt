@@ -59,6 +59,7 @@ import com.google.ai.edge.gallery.relay.server.loadModel
 import com.google.ai.edge.gallery.ui.lock.AppLockScreen
 import com.google.ai.edge.gallery.relay.security.AppLockManager
 import com.google.ai.edge.gallery.ui.common.MobileDataDownloadConfirmationHost
+import com.google.ai.edge.gallery.ui.common.storage.StorageConfirmationHost
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManagerViewModel
 import com.google.ai.edge.gallery.ui.theme.GalleryTheme
 import com.google.ai.edge.litertlm.ExperimentalApi
@@ -152,6 +153,7 @@ class MainActivity : FragmentActivity(), VirtualDevicePermissionsHost {
               GalleryApp(modelManagerViewModel = modelManagerViewModel)
               // Asks before downloading over mobile data, whichever screen started the download.
               MobileDataDownloadConfirmationHost(modelManagerViewModel = modelManagerViewModel)
+              StorageConfirmationHost(modelManagerViewModel = modelManagerViewModel)
 
               // Fade out a "mask" that has the same color as the background of the splash screen
               // to reveal the actual app content.

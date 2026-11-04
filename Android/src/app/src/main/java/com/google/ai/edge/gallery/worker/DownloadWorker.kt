@@ -142,6 +142,8 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         )
         .dataStoreRepository()
         .readAccessTokenData()
+        // An expired token makes Hugging Face answer 401 even for a public model.
+        ?.takeIf { it.expiresAtMs > System.currentTimeMillis() }
         ?.accessToken
         ?.takeIf { it.isNotEmpty() }
 
