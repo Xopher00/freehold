@@ -4,15 +4,18 @@ package com.google.ai.edge.gallery
 
 import android.os.Bundle
 
-// Box: no-op compile seam for upstream's Firebase Analytics call sites — no Firebase dependency,
-// no network call. Real analytics stays deleted per STATUS.md's standing decision.
-object NoopAnalytics {
+// Box: no-op compile seam for upstream's Firebase Analytics call sites -- no Firebase dependency,
+// no network call. Real analytics stays deleted per STATUS.md's standing decision. Mirrors the
+// surface of upstream's GalleryAnalytics so its call sites compile unchanged.
+object GalleryAnalytics {
   fun logEvent(name: String, params: Bundle? = null) {}
+
+  fun logGalleryEvent(name: String, params: Bundle) {}
 
   fun setAnalyticsCollectionEnabled(enabled: Boolean) {}
 }
 
-val firebaseAnalytics: NoopAnalytics? = null
+val firebaseAnalytics: GalleryAnalytics? = null
 
 enum class GalleryEvent(val id: String) {
   CAPABILITY_SELECT(id = "capability_select"),
@@ -30,19 +33,29 @@ enum class GalleryEvent(val id: String) {
   CONTEXT_COMPRESSION(id = "context_compression"),
   AUTO_COMPACTION_ENABLE(id = "auto_compaction_enable"),
   RESOURCE_LINK_CLICK(id = "resource_link_click"),
+  OSS_MODEL_IMPORT(id = "oss_model_import"),
+}
+
+const val BUTTON_CLICK_EVENT_LIVE_METRICS_TOGGLE = "live_metrics_toggle"
+
+/** Strongly typed action values for [GalleryEvent.BUTTON_CLICKED] telemetry. */
+enum class ButtonClickAction(val id: String) {
+  TURN_ON("turn_on"),
+  TURN_OFF("turn_off"),
 }
 
 /** Strongly typed Firebase Analytics parameter keys for inference and model lifecycle telemetry. */
 enum class InferenceMetricsParam(val key: String) {
-  MODEL_NAME("model_name"),
+  MODEL_ID("model_id"),
   MODEL_VERSION("model_version"),
-  TASK_ID("task_id"),
+  CAPABILITY_NAME("capability_name"),
   ACCELERATOR("accelerator"),
   STATUS("status"),
   ERROR_CODE("error_code"),
   TURN_INDEX("turn_index"),
   INIT_DURATION_MS("init_duration_ms"),
   SAMPLER_CONFIG("sampler_config"),
+  MODEL_CAPABILITIES("model_capabilities"),
   TOTAL_LATENCY_MS("total_latency_ms"),
   TTFT_MS("ttft_ms"),
   DECODE_DURATION_MS("decode_duration_ms"),
@@ -55,4 +68,5 @@ enum class InferenceMetricsParam(val key: String) {
   MAX_CONTEXT_TOKENS("max_context_tokens"),
   PEAK_MEMORY_MB("peak_memory_mb"),
   AVG_MEMORY_MB("avg_memory_mb"),
+  LIVE_METRICS_ENABLED("live_metrics_enabled"),
 }

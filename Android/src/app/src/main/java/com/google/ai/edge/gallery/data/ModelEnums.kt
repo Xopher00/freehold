@@ -28,6 +28,8 @@ enum class ModelCapability {
 
 enum class ModelType {
   @SerializedName("task") TASK,
+  @SerializedName("tts") TTS,
+  @SerializedName("asr") ASR,
 }
 
 /**
@@ -49,6 +51,11 @@ enum class RuntimeType(
   val autoDownloadsOnStartup: Boolean,
   val supportsTopLevelDownload: Boolean,
   val supportsDelete: Boolean,
+  /**
+   * Whether models using this runtime install each language as a separate pack after the model
+   * itself is available (for example ML Kit speech voices managed by Speech Services).
+   */
+  val installsLanguagePacks: Boolean,
 ) {
   @SerializedName("unknown")
   UNKNOWN(
@@ -56,6 +63,7 @@ enum class RuntimeType(
     autoDownloadsOnStartup = false,
     supportsTopLevelDownload = true,
     supportsDelete = true,
+    installsLanguagePacks = false,
   ),
   @SerializedName("litert_lm")
   LITERT_LM(
@@ -63,6 +71,7 @@ enum class RuntimeType(
     autoDownloadsOnStartup = false,
     supportsTopLevelDownload = true,
     supportsDelete = true,
+    installsLanguagePacks = false,
   ),
   @SerializedName("aicore")
   AICORE(
@@ -70,8 +79,24 @@ enum class RuntimeType(
     autoDownloadsOnStartup = true,
     supportsTopLevelDownload = false,
     supportsDelete = false,
+    installsLanguagePacks = false,
   ),
-
+  @SerializedName("mlkit_speech")
+  MLKIT_SPEECH(
+    downloadsViaRepository = false,
+    autoDownloadsOnStartup = false,
+    supportsTopLevelDownload = false,
+    supportsDelete = false,
+    installsLanguagePacks = true,
+  ),
+  @SerializedName("mlkit_asr")
+  MLKIT_ASR(
+    downloadsViaRepository = false,
+    autoDownloadsOnStartup = false,
+    supportsTopLevelDownload = false,
+    supportsDelete = false,
+    installsLanguagePacks = true,
+  ),
 }
 
 enum class AICoreModelReleaseStage {

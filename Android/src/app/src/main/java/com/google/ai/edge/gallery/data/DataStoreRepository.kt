@@ -18,6 +18,7 @@ package com.google.ai.edge.gallery.data
 
 import androidx.datastore.core.DataStore
 import com.google.ai.edge.gallery.proto.AccessTokenData
+import com.google.ai.edge.gallery.proto.AsrSettingsProto
 import com.google.ai.edge.gallery.proto.BenchmarkResult
 import com.google.ai.edge.gallery.proto.BenchmarkResults
 import com.google.ai.edge.gallery.proto.Cutout
@@ -26,8 +27,11 @@ import com.google.ai.edge.gallery.proto.ImportedModel
 import com.google.ai.edge.gallery.proto.Settings
 import com.google.ai.edge.gallery.proto.Skill
 import com.google.ai.edge.gallery.proto.Skills
+import com.google.ai.edge.gallery.proto.SupplementaryModelFilterProto
 import com.google.ai.edge.gallery.proto.Theme
+import com.google.ai.edge.gallery.proto.TtsSettingsProto
 import com.google.ai.edge.gallery.proto.UserData
+import com.google.ai.edge.gallery.proto.copy
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 
@@ -86,6 +90,25 @@ interface DataStoreRepository {
 
   fun deleteBenchmarkResult(index: Int)
 
+  /** Saves TTS settings to persistent DataStore storage. */
+  suspend fun saveTtsSettings(ttsSettings: TtsSettingsProto) {}
+
+  /** Reads persisted TTS settings from DataStore. */
+  fun readTtsSettings(): TtsSettingsProto = TtsSettingsProto.getDefaultInstance()
+
+  /** Saves ASR settings to persistent DataStore storage. */
+  suspend fun saveAsrSettings(asrSettings: AsrSettingsProto) {}
+
+  /** Reads persisted ASR settings from DataStore. */
+  suspend fun readAsrSettings(): AsrSettingsProto = AsrSettingsProto.getDefaultInstance()
+
+  /** Saves the modality filter chosen on the Model Manager's Supplementary tab. */
+  suspend fun saveSupplementaryModelFilter(filter: SupplementaryModelFilterProto) {}
+
+  /** Reads the persisted modality filter of the Model Manager's Supplementary tab. */
+  suspend fun readSupplementaryModelFilter(): SupplementaryModelFilterProto =
+    SupplementaryModelFilterProto.SUPPLEMENTARY_MODEL_FILTER_UNSPECIFIED
+
   fun addSkill(skill: Skill)
 
   fun setSkills(skills: List<Skill>)
@@ -126,11 +149,35 @@ interface DataStoreRepository {
 
   fun readServerStartOnBoot(): Boolean
 
+  /** Records that a promo with the specified ID has been viewed. */
+  fun addViewedPromoId(promoId: String)
+
+  /** Removes a viewed promo record. */
+  fun removeViewedPromoId(promoId: String)
+
+  /** Returns whether a promo with the specified ID has been viewed. */
+  fun hasViewedPromo(promoId: String): Boolean
+
   /** Saves whether automatic context compaction is enabled for the specified [taskId]. */
   fun saveAutoContextCompact(taskId: String, enabled: Boolean)
 
   /** Returns whether automatic context compaction is enabled for the specified [taskId]. */
   fun readAutoContextCompact(taskId: String): Boolean
+
+  /** Saves whether the live inference metrics banner is visible for the specified [taskId]. */
+  fun saveShowLiveMetrics(taskId: String, visible: Boolean)
+
+  /** Returns whether the live inference metrics banner is visible for the specified [taskId]. */
+  fun readShowLiveMetrics(taskId: String): Boolean
+
+  /**
+   * Saves [modelName] as the main model last launched from the model selection screen of the task
+   * [taskId].
+   */
+  suspend fun saveLastMainModel(taskId: String, modelName: String)
+
+  /** Returns the name of the main model last launched for each task, by task id. */
+  suspend fun readLastMainModels(): Map<String, String>
 }
 
 /** Repository for managing data using Proto DataStore. */
@@ -355,6 +402,29 @@ class DefaultDataStoreRepository(
     }
   }
 
+  override suspend fun saveTtsSettings(ttsSettings: TtsSettingsProto) {
+    dataStore.updateData { settings -> settings.toBuilder().setTtsSettings(ttsSettings).build() }
+  }
+
+  override fun readTtsSettings(): TtsSettingsProto {
+    return runBlocking { dataStore.data.first().ttsSettings }
+  }
+
+  override suspend fun saveAsrSettings(asrSettings: AsrSettingsProto) {
+    dataStore.updateData { settings -> settings.toBuilder().setAsrSettings(asrSettings).build() }
+  }
+
+  override suspend fun readAsrSettings(): AsrSettingsProto = dataStore.data.first().asrSettings
+
+  override suspend fun saveSupplementaryModelFilter(filter: SupplementaryModelFilterProto) {
+    dataStore.updateData { settings ->
+      settings.toBuilder().setSupplementaryModelFilter(filter).build()
+    }
+  }
+
+  override suspend fun readSupplementaryModelFilter(): SupplementaryModelFilterProto =
+    dataStore.data.first().supplementaryModelFilter
+
   override fun addSkill(skill: Skill) {
     runBlocking {
       skillsDataStore.updateData { skills ->
@@ -527,6 +597,34 @@ class DefaultDataStoreRepository(
     }
   }
 
+  override fun addViewedPromoId(promoId: String) {
+    runBlocking {
+      dataStore.updateData { settings ->
+        if (settings.viewedPromoIdList.contains(promoId)) {
+          settings
+        } else {
+          settings.toBuilder().addViewedPromoId(promoId).build()
+        }
+      }
+    }
+  }
+
+  override fun removeViewedPromoId(promoId: String) {
+    runBlocking {
+      dataStore.updateData { settings ->
+        val newList = settings.viewedPromoIdList.filter { it != promoId }
+        settings.toBuilder().clearViewedPromoId().addAllViewedPromoId(newList).build()
+      }
+    }
+  }
+
+  override fun hasViewedPromo(promoId: String): Boolean {
+    return runBlocking {
+      val settings = dataStore.data.first()
+      settings.viewedPromoIdList.contains(promoId)
+    }
+  }
+
   override fun saveAutoContextCompact(taskId: String, enabled: Boolean) {
     runBlocking {
       dataStore.updateData { settings ->
@@ -541,6 +639,26 @@ class DefaultDataStoreRepository(
       settings.autoContextCompactByTaskMap[taskId] ?: false
     }
   }
+
+  override fun saveShowLiveMetrics(taskId: String, visible: Boolean) {
+    runBlocking {
+      dataStore.updateData { settings -> settings.copy { showLiveMetricsByTask[taskId] = visible } }
+    }
+  }
+
+  override fun readShowLiveMetrics(taskId: String): Boolean {
+    return runBlocking {
+      val settings = dataStore.data.first()
+      settings.showLiveMetricsByTaskMap[taskId] ?: false
+    }
+  }
+
+  override suspend fun saveLastMainModel(taskId: String, modelName: String) {
+    dataStore.updateData { settings -> settings.copy { lastMainModelByTask[taskId] = modelName } }
+  }
+
+  override suspend fun readLastMainModels(): Map<String, String> =
+    dataStore.data.first().lastMainModelByTaskMap
 }
 
 // WP (spec section 6): mirrors NotificationScheduleManagerEntryPoint

@@ -21,7 +21,6 @@ import android.graphics.Bitmap
 import android.os.Build
 import android.util.Log
 import androidx.lifecycle.viewModelScope
-import com.google.ai.edge.gallery.R
 import com.google.ai.edge.gallery.agent.AgentEvent
 import com.google.ai.edge.gallery.agent.AgentExecutionContext
 import com.google.ai.edge.gallery.agent.AgentRequest
@@ -29,23 +28,28 @@ import com.google.ai.edge.gallery.agent.AgentRuntimeConfig
 import com.google.ai.edge.gallery.agent.AgentRuntimeExecutor
 import com.google.ai.edge.gallery.agent.AiChatExecutor
 import com.google.ai.edge.gallery.agent.Attachment
+import com.google.ai.edge.gallery.agent.sessions.ContextCompactionSource
 import com.google.ai.edge.gallery.agent.sessions.LlmSessionManager
+import com.google.ai.edge.gallery.agent.sessions.formatAttachedFilePrompt
 import com.google.ai.edge.gallery.agent.sessions.generateSessionId
 import com.google.ai.edge.gallery.common.SystemPromptHelper
 import com.google.ai.edge.gallery.common.metrics.InferenceMetrics
+import com.google.ai.edge.gallery.common.metrics.MetricsTracker
+import com.google.ai.edge.gallery.data.Config
 import com.google.ai.edge.gallery.data.ConfigKeys
 import com.google.ai.edge.gallery.data.DataStoreRepository
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.data.SystemPromptRepository
 import com.google.ai.edge.gallery.data.Task
 import com.google.ai.edge.gallery.data.awaitInitialization
+import com.google.ai.edge.gallery.di.IoDispatcher
 import com.google.ai.edge.gallery.proto.ChatSessionProto
 import com.google.ai.edge.gallery.relay.runtime.isContextOverflow
 import com.google.ai.edge.gallery.relay.server.handlers.withBusyGuard
 import com.google.ai.edge.gallery.tools.ToolAction
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageAudioClip
-import com.google.ai.edge.gallery.ui.common.chat.ChatMessageDivider
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageError
+import com.google.ai.edge.gallery.ui.common.chat.ChatMessageFile
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageInfo
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageLoading
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageMapper
@@ -65,6 +69,7 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import java.util.UUID
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.SendChannel
@@ -74,6 +79,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 
 private const val TAG = "AGLlmChatViewModel"
@@ -85,7 +91,8 @@ open class LlmChatViewModelBase(
   override val runtimeExecutor: AgentRuntimeExecutor,
   llmSessionManager: LlmSessionManager,
   dataStoreRepository: DataStoreRepository? = null,
-) : ChatViewModel(runtimeExecutor, llmSessionManager, dataStoreRepository) {
+  ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+) : ChatViewModel(runtimeExecutor, llmSessionManager, dataStoreRepository, ioDispatcher) {
   private val _uiSystemPrompt = MutableStateFlow("")
   val uiSystemPrompt: StateFlow<String> = _uiSystemPrompt.asStateFlow()
   private val _liveMetrics = MutableStateFlow<InferenceMetrics?>(null)
@@ -94,10 +101,12 @@ open class LlmChatViewModelBase(
   private var observedLiveMetricsModel: Model? = null
   // Map to track if the session was stopped by the model for a given model name.
   private val sessionStoppedByModel = mutableMapOf<String, Boolean>()
-  // The current task ID for the session.
-  private var currentTaskId: String = ""
   // Active session transition job to ensure transitions (restore, new session, reset) do not race.
   private var sessionTransitionJob: Job? = null
+
+  private fun Model.InitializationStatus.llmMetricsTracker(): MetricsTracker? =
+    ((this as? Model.InitializationStatus.Initialized)?.instance as? LlmModelInstance)
+      ?.metricsTracker
 
   /**
    * Reactively observes the live [InferenceMetrics] stream of [model] across its initialization and
@@ -111,6 +120,9 @@ open class LlmChatViewModelBase(
       return
     }
     if (observedLiveMetricsModel === model && liveMetricsJob?.isActive == true) {
+      if (currentTaskId.isNotEmpty()) {
+        syncLiveMetricsVisibility(model = model, enabled = uiState.value.showLiveMetrics)
+      }
       return
     }
     observedLiveMetricsModel = model
@@ -118,13 +130,19 @@ open class LlmChatViewModelBase(
     _liveMetrics.value = null
     liveMetricsJob = viewModelScope.launch {
       model.initStatusFlow
-        .flatMapLatest { status ->
-          ((status as? Model.InitializationStatus.Initialized)?.instance as? LlmModelInstance)
-            ?.metricsTracker
-            ?.liveMetrics ?: flowOf(null)
+        .onEach { status ->
+          if (currentTaskId.isNotEmpty()) {
+            status.llmMetricsTracker()?.updateLiveMetrics(enabled = uiState.value.showLiveMetrics)
+          }
         }
+        .flatMapLatest { status -> status.llmMetricsTracker()?.liveMetrics ?: flowOf(null) }
         .collect { metrics -> _liveMetrics.value = metrics }
     }
+  }
+
+  override fun syncLiveMetricsVisibility(model: Model?, enabled: Boolean) {
+    val targetModel = model ?: observedLiveMetricsModel ?: return
+    targetModel.initStatusFlow.value.llmMetricsTracker()?.updateLiveMetrics(enabled = enabled)
   }
 
   /**
@@ -191,6 +209,7 @@ open class LlmChatViewModelBase(
     input: String,
     images: List<Bitmap> = listOf(),
     audioMessages: List<ChatMessageAudioClip> = listOf(),
+    files: List<ChatMessageFile> = listOf(),
     onFirstToken: (Model) -> Unit = {},
     onDone: () -> Unit = {},
     onError: (String) -> Unit,
@@ -207,6 +226,34 @@ open class LlmChatViewModelBase(
         setInProgress(true)
         setPreparing(true)
 
+        if (sessionStoppedByModel[model.name] == true) {
+          sessionStoppedByModel[model.name] = false
+          // The messages of the current turn (its attached files followed by its text, if any) have
+          // already been added to the chat, but they are sent with this request rather than seeded.
+          val currentTurnMessageCount = files.size + (if (input.isNotEmpty()) 1 else 0)
+          val initialMessages =
+            (uiState.value.messagesByModel[model.name] ?: emptyList())
+              .filter { it is ChatMessageText || it is ChatMessageFile }
+              .dropLast(currentTurnMessageCount)
+              .mapNotNull { convertToLitertMessage(it) }
+          val config =
+            AgentRuntimeConfig(
+              model = model,
+              taskId = currentTaskId,
+              supportImage = model.supportImage,
+              supportAudio = model.supportAudio,
+              systemInstruction = _uiSystemPrompt.value.ifEmpty { null },
+              initialMessages = initialMessages,
+            )
+          runtimeExecutor.resetSession(config = config)
+          if (initialMessages.isNotEmpty()) {
+            // The stopped turn was never persisted, so persist the in-memory history first. Runs
+            // before the loading message is added so that a compaction divider does not follow it.
+            persistCurrentSession(model = model, taskId = currentTaskId)
+            compactSeededHistoryIfNeeded(model = model, taskId = currentTaskId)
+          }
+        }
+
         // Loading.
         addMessage(model = model, message = ChatMessageLoading(accelerator = accelerator))
 
@@ -217,6 +264,16 @@ open class LlmChatViewModelBase(
         for (audioMessage in audioMessages) {
           attachments.add(Attachment.AudioBytes(audioMessage.genByteArrayForWav()))
         }
+
+        val fileAttachmentsContext =
+          files.joinToString("\n\n") { file -> formatAttachedFilePrompt(file.name, file.content) }
+        val finalQuery =
+          when {
+            fileAttachmentsContext.isNotEmpty() && input.isNotBlank() ->
+              "$input\n\n$fileAttachmentsContext"
+            fileAttachmentsContext.isNotEmpty() -> fileAttachmentsContext
+            else -> input
+          }
 
         val enableThinking =
           allowThinking &&
@@ -230,51 +287,18 @@ open class LlmChatViewModelBase(
             }
           }
 
-        val request = AgentRequest(query = input, attachments = attachments, metadata = metadata)
+        val request = AgentRequest(query = finalQuery, attachments = attachments, metadata = metadata)
 
         val executionContext = AgentExecutionContext()
 
         var firstRun = true
         val start = System.currentTimeMillis()
 
-        if (sessionStoppedByModel[model.name] == true) {
-          sessionStoppedByModel[model.name] = false
-          val initialMessages =
-            (uiState.value.messagesByModel[model.name] ?: emptyList())
-              .filterIsInstance<ChatMessageText>()
-              .dropLast(1)
-              .mapNotNull { convertToLitertMessage(it) }
-          val config =
-            AgentRuntimeConfig(
-              model = model,
-              taskId = currentTaskId,
-              supportImage = model.supportImage,
-              supportAudio = model.supportAudio,
-              systemInstruction = _uiSystemPrompt.value.ifEmpty { null },
-              initialMessages = initialMessages,
-            )
-          runtimeExecutor.resetSession(config = config)
-        }
-
         // Run inference.
         runtimeExecutor.executeStream(context = executionContext, request = request).collect { event
           ->
           when (event) {
             is AgentEvent.LoopInitiated -> {}
-            is AgentEvent.ContextCompactionStarted -> {
-              setContextCompactionStatus(model, ContextCompactionStatus.COMPACTING)
-            }
-            is AgentEvent.ContextCompactionFinished -> {
-              if (event.success) {
-                insertMessageBeforeCurrentTurn(
-                  model = model,
-                  message = ChatMessageDivider(textResId = R.string.context_compressed_success),
-                )
-              }
-              if (getContextCompactionStatus(model) == ContextCompactionStatus.COMPACTING) {
-                setContextCompactionStatus(model, ContextCompactionStatus.IDLE)
-              }
-            }
             is AgentEvent.StreamToken -> {
               val lastMessage = getLastMessage(model = model)
               val wasLoading = lastMessage?.type == ChatMessageType.LOADING
@@ -306,7 +330,7 @@ open class LlmChatViewModelBase(
                 }
                 updateLastThinkingMessageContentIncrementally(
                   model = model,
-                  partialContent = thinkingText!!,
+                  partialContent = thinkingText,
                 )
               } else {
                 if (currentLastMessage?.type == ChatMessageType.THINKING) {
@@ -383,18 +407,21 @@ open class LlmChatViewModelBase(
                 }
               }
               setPreparing(false)
-              val isLimitReached = llmSessionManager.isTokenLimitReached(currentSessionId, model)
               try {
-                if (isLimitReached) {
-                  if (isAutoCompactEnabled(currentTaskId)) {
-                    executeCompactContext(
-                      model = model,
-                      taskId = currentTaskId,
-                      triggerType = ContextCompactionTriggerType.AUTO,
-                    )
-                  } else {
-                    setContextCompactionStatus(model, ContextCompactionStatus.TOKEN_LIMIT_REACHED)
-                  }
+                persistCurrentSession(model = model, taskId = currentTaskId)
+                val isLimitReached = llmSessionManager.isTokenLimitReached(currentSessionId, model)
+                if (
+                  isLimitReached &&
+                    isAutoCompactEnabled(currentTaskId) &&
+                    Config.isContextCompactEnabled()
+                ) {
+                  executeCompactContext(
+                    model = model,
+                    taskId = currentTaskId,
+                    triggerType = ContextCompactionTriggerType.AUTO,
+                  )
+                } else if (isLimitReached) {
+                  setContextCompactionStatus(model, ContextCompactionStatus.TOKEN_LIMIT_REACHED)
                 }
               } finally {
                 setInProgress(false)
@@ -517,6 +544,11 @@ open class LlmChatViewModelBase(
           initialMessages = initialMessages,
         )
       runtimeExecutor.resetSession(config = config)
+      if (!clearHistory && initialMessages.isNotEmpty()) {
+        // The seeded history comes from the persisted session (e.g. a restored session), so it is
+        // not persisted again here; that would only bump the session's timestamp.
+        compactSeededHistoryIfNeeded(model = model, taskId = task.id)
+      }
 
       setIsResettingSession(false)
       onDone()
@@ -526,6 +558,23 @@ open class LlmChatViewModelBase(
       Log.e(TAG, "Failed to reset session: ${e.message}", e)
       setIsResettingSession(false)
     }
+  }
+
+  /**
+   * Truncates the history that the conversation of [model] was just reset with if it no longer fits
+   * the context window, appending the context compressed divider if it does.
+   *
+   * The reset conversation is only prefilled with its history together with the next turn, so the
+   * compactor estimates the token usage from the persisted session; any history that is not
+   * persisted yet must be persisted before calling this.
+   */
+  private suspend fun compactSeededHistoryIfNeeded(model: Model, taskId: String) {
+    executeCompactContext(
+      model = model,
+      taskId = taskId,
+      triggerType = ContextCompactionTriggerType.AUTO,
+      source = ContextCompactionSource.CHAT_HISTORY,
+    )
   }
 
   /**
@@ -705,9 +754,10 @@ constructor(
   @AiChatExecutor runtimeExecutor: AgentRuntimeExecutor,
   llmSessionManager: LlmSessionManager,
   dataStoreRepository: DataStoreRepository? = null,
+  @IoDispatcher ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) :
 LlmChatViewModelBase(systemPromptRepository, null, runtimeExecutor,
-llmSessionManager, dataStoreRepository)
+llmSessionManager, dataStoreRepository, ioDispatcher)
 
 @HiltViewModel
 class LlmAskImageViewModel
@@ -717,9 +767,10 @@ constructor(
   @AiChatExecutor runtimeExecutor: AgentRuntimeExecutor,
   llmSessionManager: LlmSessionManager,
   dataStoreRepository: DataStoreRepository? = null,
+  @IoDispatcher ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) :
 LlmChatViewModelBase(systemPromptRepository, null, runtimeExecutor,
-llmSessionManager, dataStoreRepository)
+llmSessionManager, dataStoreRepository, ioDispatcher)
 
 @HiltViewModel
 class LlmAskAudioViewModel
@@ -729,6 +780,7 @@ constructor(
   @AiChatExecutor runtimeExecutor: AgentRuntimeExecutor,
   llmSessionManager: LlmSessionManager,
   dataStoreRepository: DataStoreRepository? = null,
+  @IoDispatcher ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) :
 LlmChatViewModelBase(systemPromptRepository, null, runtimeExecutor,
-llmSessionManager, dataStoreRepository)
+llmSessionManager, dataStoreRepository, ioDispatcher)

@@ -17,12 +17,14 @@
 package com.google.ai.edge.gallery
 
 import android.app.Application
+import android.os.Process
 import com.google.ai.edge.gallery.data.DataStoreRepository
 import com.google.ai.edge.gallery.notifications.NotificationScheduleManager
 import com.google.ai.edge.gallery.relay.security.AppLockManager
 import com.google.ai.edge.gallery.relay.security.OfflineMode
 import com.google.ai.edge.gallery.relay.security.SecurityAuditLog
 import com.google.ai.edge.gallery.relay.security.SignatureVerifier
+import com.google.ai.edge.gallery.services.tts.TtsMemoryTrimCallbacks
 import com.google.ai.edge.gallery.ui.theme.ThemeSettings
 import com.google.firebase.FirebaseApp
 import dagger.hilt.android.HiltAndroidApp
@@ -33,9 +35,17 @@ class GalleryApplication : Application() {
 
   @Inject lateinit var dataStoreRepository: DataStoreRepository
   @Inject lateinit var notificationScheduleManager: NotificationScheduleManager
+  @Inject lateinit var ttsMemoryTrimCallbacks: TtsMemoryTrimCallbacks
 
   override fun onCreate() {
+    // androidx.pdf parses PDFs in an isolated service process, which also instantiates this
+    // Application. Isolated processes have no access to storage or most system services (e.g.
+    // Firebase initialization crashes there), so skip all app initialization in them.
+    if (Process.isIsolated()) {
+      return
+    }
     super.onCreate()
+    registerComponentCallbacks(ttsMemoryTrimCallbacks)
     // Initialize the notification schedule manager to load the scheduled notifications from the
     // disk.
     notificationScheduleManager.initialize()

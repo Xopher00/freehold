@@ -7,10 +7,11 @@ import android.util.Log
 import com.google.ai.edge.gallery.BuildConfig
 import com.google.ai.edge.gallery.R
 import com.google.ai.edge.gallery.common.getJsonResponse
-import com.google.ai.edge.gallery.common.isAICoreSupported
 import com.google.ai.edge.gallery.data.BuiltInTaskId
 import com.google.ai.edge.gallery.data.Category
 import com.google.ai.edge.gallery.data.CategoryInfo
+import com.google.ai.edge.gallery.data.DeviceIdentity
+import com.google.ai.edge.gallery.data.DeviceRequirementRegistry
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.data.ModelAllowlist
 import com.google.ai.edge.gallery.data.RuntimeType
@@ -249,17 +250,8 @@ class ModelAllowlistLoader(
     curTasks: List<Task>,
     allowlistModels: MutableList<Model>,
   ) {
-    val isAICoreAvailable by lazy {
-      Log.d(TAG, "loadModelAllowlist: Checking AICore availability")
-      val allowedDeviceModelsSet =
-        modelAllowlist.aicoreRequirements
-          ?.allowedDeviceGroups
-          ?.asSequence()
-          ?.flatMap { it.deviceModels }
-          ?.map { it.lowercase() }
-          ?.toSet()
-      isAICoreSupported(allowedDeviceModelsSet)
-    }
+    val deviceRequirements = DeviceRequirementRegistry.from(modelAllowlist)
+    val device = DeviceIdentity.current()
 
     Log.d(TAG, "loadModelAllowlist: Converting models. Total models: ${modelAllowlist.models.size}")
     val nameToModel = mutableMapOf<String, Model>()
@@ -268,7 +260,9 @@ class ModelAllowlistLoader(
         continue
       }
 
-      if (allowedModel.runtimeType == RuntimeType.AICORE && !isAICoreAvailable) {
+      val requiredSet = allowedModel.requiredDeviceRequirementSet
+      if (requiredSet != null && !deviceRequirements.isSatisfied(requiredSet, device)) {
+        Log.d(TAG, "Ignoring model '${allowedModel.name}': device not in requirement set '$requiredSet'")
         continue
       }
 

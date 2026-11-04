@@ -52,21 +52,23 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.referentialEqualityPolicy
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -84,9 +86,15 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.google.ai.edge.gallery.R
+import com.google.ai.edge.gallery.common.logButtonClick
 import com.google.ai.edge.gallery.data.BuiltInTaskId
+import com.google.ai.edge.gallery.data.ImportOrigin
 import com.google.ai.edge.gallery.data.Model
+import com.google.ai.edge.gallery.data.OssModelImportLogger
 import com.google.ai.edge.gallery.data.Task
 import com.google.ai.edge.gallery.data.supportModelBenchmark
 import com.google.ai.edge.gallery.relay.Flags
@@ -108,6 +116,14 @@ import kotlinx.coroutines.launch
 
 private const val TAG = "AGGlobalMM"
 
+private data class PendingModelImport(
+  val uri: Uri,
+  val origin: ImportOrigin,
+  val info: ImportedModel? = null,
+)
+
+private data class ModelDetailsContext(val model: HfModelItemProto, val origin: ImportOrigin)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun GlobalModelManager(
@@ -121,8 +137,17 @@ fun GlobalModelManager(
   importUrl: String? = null,
   importIsImageGen: Boolean = false,
   initialImportUrl: String? = null,
+  supplementaryModelsViewModel: SupplementaryModelsViewModel? = null,
 ) {
-  val uiState by viewModel.uiState.collectAsState()
+  val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+  // The UI state is replaced several times a second while a model downloads. Only read the fields
+  // this screen needs through derivedStateOf so download progress doesn't recompose the whole
+  // screen. Each ModelItem observes its own download status.
+  val modelImportingUpdateTrigger by remember {
+    derivedStateOf { uiState.modelImportingUpdateTrigger }
+  }
+  val allTasks by remember { derivedStateOf(referentialEqualityPolicy()) { uiState.tasks } }
+  val supplementaryModelsSize by remember { derivedStateOf { uiState.supplementaryModels.size } }
   val builtInModels = remember { mutableStateListOf<Model>() }
   val importedModels = remember { mutableStateListOf<Model>() }
   val taskCandidates = remember { mutableStateListOf<Task>() }
@@ -134,19 +159,17 @@ fun GlobalModelManager(
   var huggingFaceUrlInput by remember { mutableStateOf("") }
   var showUnsupportedModelDialog by remember { mutableStateOf(false) }
   var unsupportedModelErrorMessage by remember { mutableStateOf("") }
-  val selectedLocalModelFileUri = remember { mutableStateOf<Uri?>(null) }
-  val selectedImportedModelInfo = remember { mutableStateOf<ImportedModel?>(null) }
+  var pendingModelImport by remember { mutableStateOf<PendingModelImport?>(null) }
   val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
   var showImportDialog by remember { mutableStateOf(false) }
   var showImportingDialog by remember { mutableStateOf(false) }
   var showUntrustedPublisherWarning by remember { mutableStateOf(false) }
   var untrustedPublisherName by remember { mutableStateOf("") }
-  val pendingUntrustedImportUri = remember { mutableStateOf<Uri?>(null) }
-  // Mutually exclusive with pendingUntrustedImportUri: (fileName, url) for an SD import pending
+  val pendingUntrustedImport = remember { mutableStateOf<PendingModelImport?>(null) }
+  // Mutually exclusive with pendingUntrustedImport: (fileName, url) for an SD import pending
   // the same warning, resumed via addImportedSdModel rather than ModelImportDialog.
   val pendingImageGenImport = remember { mutableStateOf<Pair<String, String>?>(null) }
-  var selectedModelForDetails by remember { mutableStateOf<HfModelItemProto?>(null) }
-  var showModelDetailsSheet by remember { mutableStateOf(false) }
+  var modelDetailsContext by remember { mutableStateOf<ModelDetailsContext?>(null) }
   var isLoadingModelCardDetails by remember { mutableStateOf(false) }
   val scope = rememberCoroutineScope()
   val context = LocalContext.current
@@ -160,6 +183,15 @@ fun GlobalModelManager(
   }
   val snackbarHostState = remember { SnackbarHostState() }
   val modelItemExpandedStates = remember { mutableStateMapOf<String, Boolean>() }
+  var selectedTab by remember { mutableStateOf(ModelManagerTab.MAIN) }
+  val supplementaryUiState =
+    supplementaryModelsViewModel?.uiState?.collectAsStateWithLifecycle()?.value
+  val supplementaryModelCount = supplementaryUiState?.visibleModelCount ?: supplementaryModelsSize
+  val supplementaryActions =
+    rememberSupplementaryModelsActions(
+      supplementaryModelsViewModel = supplementaryModelsViewModel,
+      modelManagerViewModel = viewModel,
+    )
 
   // Local (non-URL) imports are user-chosen and skip the publisher check entirely; returns null
   // for those and for a known-publisher HF URL, else the (possibly blank) owner namespace.
@@ -170,7 +202,12 @@ fun GlobalModelManager(
     return if (isKnownPublisherNamespace(owner)) null else owner.orEmpty()
   }
 
-  val processModelUri: (Uri, Boolean) -> Unit = { uri, isWebImport ->
+  LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+    viewModel.refreshSupplementaryStatuses()
+    supplementaryModelsViewModel?.refreshOnResume()
+  }
+
+  val processModelUri: (Uri, Boolean, ImportOrigin) -> Unit = { uri, isWebImport, origin ->
     validateAndProcessModelUri(
       uri = uri,
       context = context,
@@ -180,13 +217,14 @@ fun GlobalModelManager(
         showUnsupportedModelDialog = true
       },
       onValidModelUri = { validUri ->
+        val pending = PendingModelImport(uri = validUri, origin = origin)
         val untrustedPublisher = computeUntrustedPublisher(validUri)
         if (untrustedPublisher != null) {
-          pendingUntrustedImportUri.value = validUri
+          pendingUntrustedImport.value = pending
           untrustedPublisherName = untrustedPublisher
           showUntrustedPublisherWarning = true
         } else {
-          selectedLocalModelFileUri.value = validUri
+          pendingModelImport = pending
           showImportDialog = true
         }
       },
@@ -213,7 +251,7 @@ fun GlobalModelManager(
         viewModel.addImportedSdModel(fileName = fileName, fileSize = 0L, url = importUrl)
       }
     } else {
-      processModelUri(uri, /* isWebImport= */ true)
+      processModelUri(uri, /* isWebImport= */ true, ImportOrigin(source = OssModelImportLogger.Source.HF_URL))
     }
   }
   val handleImportUrl: (String) -> Unit =
@@ -221,6 +259,7 @@ fun GlobalModelManager(
       { rawUrl: String ->
         val url = rawUrl.trim()
         if (url.isNotEmpty()) {
+          val origin = ImportOrigin(source = OssModelImportLogger.Source.HF_URL)
           showHuggingFaceUrlDialog = false
           val urlInfo = extractHfUrlInfo(url)
           val targetModelId = urlInfo.modelId
@@ -233,15 +272,14 @@ fun GlobalModelManager(
                 } else {
                   url.toUri()
                 }
-              processModelUri(fileUri, /* isWebImport= */ true)
+              processModelUri(fileUri, /* isWebImport= */ true, origin)
             }
             targetModelId != null -> {
               isLoadingModelCardDetails = true
               viewModel.fetchModelDetails(targetModelId) { detailedModel ->
                 isLoadingModelCardDetails = false
                 if (detailedModel != null) {
-                  selectedModelForDetails = detailedModel
-                  showModelDetailsSheet = true
+                  modelDetailsContext = ModelDetailsContext(model = detailedModel, origin = origin)
                 } else {
                   unsupportedModelErrorMessage =
                     getErrorMessage(context, R.string.could_not_fetch_model_details, targetModelId)
@@ -250,7 +288,7 @@ fun GlobalModelManager(
               }
             }
             else -> {
-              processModelUri(url.toUri(), /* isWebImport= */ true)
+              processModelUri(url.toUri(), /* isWebImport= */ true, origin)
             }
           }
         }
@@ -262,14 +300,19 @@ fun GlobalModelManager(
       contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
       if (result.resultCode == android.app.Activity.RESULT_OK) {
-        result.data?.data?.let { uri -> processModelUri(uri, /* isWebImport= */ false) }
-          ?: run { Log.d(TAG, "No file selected or URI is null.") }
+        result.data?.data?.let { uri ->
+          processModelUri(
+            uri,
+            /* isWebImport= */ false,
+            ImportOrigin(source = OssModelImportLogger.Source.LOCAL_FILE),
+          )
+        } ?: run { Log.d(TAG, "No file selected or URI is null.") }
       } else {
         Log.d(TAG, "File picking cancelled.")
       }
     }
 
-  LaunchedEffect(uiState.modelImportingUpdateTrigger) {
+  LaunchedEffect(modelImportingUpdateTrigger) {
     val allowlistModels = viewModel.allowlistModels
     val allowlistOrderMap = allowlistModels.withIndex().associate { it.value.name to it.index }
 
@@ -296,9 +339,9 @@ fun GlobalModelManager(
 
   // Calculate model variants by grouping models with a parentModelName.
   val modelVariants by
-    remember(uiState.modelImportingUpdateTrigger) {
+    remember(modelImportingUpdateTrigger) {
       derivedStateOf {
-        val allModels = uiState.tasks.flatMap { it.models }.distinct()
+        val allModels = allTasks.flatMap { it.models }.distinct()
         allModels.filter { it.isVariant }.groupBy { it.hierarchy.parentModelName.orEmpty() }
       }
     }
@@ -339,7 +382,8 @@ fun GlobalModelManager(
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurface,
               )
-              val totalModelCount = builtInModels.size + importedModels.size
+              val totalModelCount =
+                builtInModels.size + importedModels.size + supplementaryModelCount
               Text(
                 text = stringResource(R.string.model_manager_models_count_title, totalModelCount),
                 color = MaterialTheme.colorScheme.onSurface,
@@ -363,7 +407,7 @@ fun GlobalModelManager(
       )
     },
     floatingActionButton = {
-      val showImportFab = true
+      val showImportFab = selectedTab == ModelManagerTab.MAIN
       if (showImportFab) {
         // A floating action button to show "import model" bottom sheet.
         val cdImportModelFab = stringResource(R.string.cd_import_model_button)
@@ -385,6 +429,55 @@ fun GlobalModelManager(
             .fillMaxWidth()
             .padding(top = innerPadding.calculateTopPadding())
       ) {
+        PrimaryTabRow(
+          selectedTabIndex = selectedTab.ordinal,
+          containerColor = Color.Transparent,
+        ) {
+          val mainCount = builtInModels.size + importedModels.size
+          val suppCount = supplementaryModelCount
+          Tab(
+            selected = selectedTab == ModelManagerTab.MAIN,
+            onClick = {
+              if (selectedTab != ModelManagerTab.MAIN) {
+                Log.d(TAG, "Analytics: button_clicked, event_type=model_manager_tab_main")
+                logButtonClick("model_manager_tab_main")
+              }
+              selectedTab = ModelManagerTab.MAIN
+            },
+            text = {
+              Text(
+                stringResource(R.string.main_models_tab_title, mainCount),
+                color =
+                  if (selectedTab == ModelManagerTab.MAIN) MaterialTheme.colorScheme.primary
+                  else MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+            },
+          )
+          Tab(
+            selected = selectedTab == ModelManagerTab.SUPPLEMENTARY,
+            onClick = {
+              if (selectedTab != ModelManagerTab.SUPPLEMENTARY) {
+                Log.d(
+                  TAG,
+                  "Analytics: button_clicked, event_type=model_manager_tab_supplementary",
+                )
+                logButtonClick("model_manager_tab_supplementary")
+              }
+              selectedTab = ModelManagerTab.SUPPLEMENTARY
+            },
+            text = {
+              Text(
+                stringResource(R.string.supplementary_models_tab_title, suppCount),
+                color =
+                  if (selectedTab == ModelManagerTab.SUPPLEMENTARY) {
+                    MaterialTheme.colorScheme.primary
+                  } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                  },
+              )
+            },
+          )
+        }
 
         LazyColumn(
           modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
@@ -392,7 +485,16 @@ fun GlobalModelManager(
           contentPadding =
             PaddingValues(top = 16.dp, bottom = innerPadding.calculateBottomPadding() + 80.dp),
         ) {
-          val showSupplementaryTab = false
+          val showSupplementaryTab = selectedTab == ModelManagerTab.SUPPLEMENTARY
+          if (showSupplementaryTab && supplementaryUiState != null) {
+            supplementaryModelItems(
+              uiState = supplementaryUiState,
+              modelItemExpandedStates = modelItemExpandedStates,
+              viewModel = viewModel,
+              tosViewModel = tosViewModel,
+              actions = supplementaryActions,
+            )
+          }
           if (!showSupplementaryTab) {
             items(builtInModels) { model ->
               val expanded = modelItemExpandedStates.getOrDefault(model.name, true)
@@ -606,18 +708,18 @@ fun GlobalModelManager(
       },
       onDismissRequest = {
         showUntrustedPublisherWarning = false
-        pendingUntrustedImportUri.value = null
+        pendingUntrustedImport.value = null
         pendingImageGenImport.value = null
       },
       confirmButton = {
         TextButton(
           onClick = {
             showUntrustedPublisherWarning = false
-            pendingUntrustedImportUri.value?.let { uri ->
-              selectedLocalModelFileUri.value = uri
+            pendingUntrustedImport.value?.let { pending ->
+              pendingModelImport = pending
               showImportDialog = true
             }
-            pendingUntrustedImportUri.value = null
+            pendingUntrustedImport.value = null
             pendingImageGenImport.value?.let { (fileName, url) ->
               viewModel.addImportedSdModel(fileName = fileName, fileSize = 0L, url = url)
             }
@@ -631,7 +733,7 @@ fun GlobalModelManager(
         TextButton(
           onClick = {
             showUntrustedPublisherWarning = false
-            pendingUntrustedImportUri.value = null
+            pendingUntrustedImport.value = null
             pendingImageGenImport.value = null
           }
         ) {
@@ -646,8 +748,15 @@ fun GlobalModelManager(
       onNavigateUp = { showHfExploreScreen = false },
       onOpenUrlImportDialog = { showHuggingFaceUrlDialog = true },
       onModelCardSelected = { detailedModel ->
-        selectedModelForDetails = detailedModel
-        showModelDetailsSheet = true
+        modelDetailsContext =
+          ModelDetailsContext(
+            model = detailedModel,
+            origin =
+              ImportOrigin(
+                source = OssModelImportLogger.Source.HF_MODEL_CARD,
+                modelId = detailedModel.id,
+              ),
+          )
       },
     )
   }
@@ -669,13 +778,13 @@ fun GlobalModelManager(
 
   // Import dialog
   if (showImportDialog) {
-    selectedLocalModelFileUri.value?.let { uri ->
+    pendingModelImport?.let { pending ->
       ModelImportDialog(
-        uri = uri,
+        uri = pending.uri,
         huggingFaceApiClient = viewModel.huggingFaceApiClient,
         onDismiss = { showImportDialog = false },
         onDone = { info ->
-          selectedImportedModelInfo.value = info
+          pendingModelImport = pending.copy(info = info)
           showImportDialog = false
           showHfExploreScreen = false
           showImportingDialog = true
@@ -687,14 +796,15 @@ fun GlobalModelManager(
 
   // Importing in progress dialog.
   if (showImportingDialog) {
-    selectedLocalModelFileUri.value?.let { uri ->
-      selectedImportedModelInfo.value?.let { info ->
+    pendingModelImport?.let { pending ->
+      pending.info?.let { info ->
         ModelImportingDialog(
-          uri = uri,
+          uri = pending.uri,
           info = info,
           onDismiss = { showImportingDialog = false },
+          onError = { viewModel.onModelImportFailed(pending.origin) },
           onDone = {
-            viewModel.addImportedLlmModel(info = it)
+            viewModel.addImportedLlmModel(info = it, origin = pending.origin)
             showImportingDialog = false
 
             // Show a snack bar for successful import.
@@ -736,18 +846,15 @@ fun GlobalModelManager(
   }
 
   // Model card details sheet
-  if (showModelDetailsSheet && selectedModelForDetails != null) {
+  modelDetailsContext?.let { details ->
     HfModelDetailsSheet(
-      modelItem = selectedModelForDetails!!,
-      onDismiss = {
-        showModelDetailsSheet = false
-        selectedModelForDetails = null
-      },
+      modelItem = details.model,
+      onDismiss = { modelDetailsContext = null },
       onImportModelFile = { modelId, fileName ->
-        showModelDetailsSheet = false
-        selectedModelForDetails = null
+        val origin = details.origin
+        modelDetailsContext = null
         val fileUrl = "https://huggingface.co/$modelId/resolve/main/$fileName?download=true"
-        processModelUri(fileUrl.toUri(), true)
+        processModelUri(fileUrl.toUri(), true, origin)
       },
     )
   }

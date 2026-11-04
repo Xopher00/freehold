@@ -36,6 +36,8 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -80,18 +82,20 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -115,7 +119,15 @@ import com.google.ai.edge.gallery.ui.common.ErrorDialog
 import com.google.ai.edge.gallery.ui.common.FloatingBanner
 import com.google.ai.edge.gallery.ui.common.RotationalLoader
 import com.google.ai.edge.gallery.ui.common.ScrollToBottomButton
+import com.google.ai.edge.gallery.ui.common.asr.rememberChatAsrDictationViewModel
+import com.google.ai.edge.gallery.ui.common.tts.ChatTtsControlBanner
+import com.google.ai.edge.gallery.ui.common.tts.TtsChatEffects
+import com.google.ai.edge.gallery.ui.common.tts.TtsPlaybackController
+import com.google.ai.edge.gallery.ui.common.tts.TtsSpeakerButton
+import com.google.ai.edge.gallery.ui.common.tts.rememberChatTtsScrollState
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManagerViewModel
+import com.google.ai.edge.gallery.ui.modelmanager.isTaskEligibleForAudioConfigOnboarding
+import com.google.ai.edge.gallery.ui.modelmanager.refreshAudioConfigOnboardingState
 import com.google.ai.edge.gallery.ui.theme.customColors
 import kotlinx.coroutines.android.awaitFrame
 import kotlinx.coroutines.delay
@@ -150,17 +162,21 @@ fun ChatPanel(
   onSkillClicked: () -> Unit = {},
   onMcpClicked: () -> Unit = {},
   onImageSelected: (bitmaps: List<Bitmap>, selectedBitmapIndex: Int) -> Unit = { _, _ -> },
+  onFileSelected: (ChatMessageFile) -> Unit = {},
   showStopButtonInInputWhenInProgress: Boolean = false,
   showImagePicker: Boolean = false,
   showAudioPicker: Boolean = false,
+  showTextFilePicker: Boolean = false,
   emptyStateComposable: @Composable (Model) -> Unit = {},
   aboveInputComposable: @Composable (Model) -> Unit = {},
   onNewChatClicked: () -> Unit = {},
+  ttsController: TtsPlaybackController? = null,
 ) {
   val uiState by viewModel.uiState.collectAsState()
   val messages = uiState.messagesByModel[selectedModel.name] ?: listOf()
   val modelInitStatus by selectedModel.initStatusFlow.collectAsState()
   val isLiveMetricsFlagEnabled = false
+  val isTextFileInputEnabled = false
   val isLiveMetricsSupported = isLiveMetricsFlagEnabled && !selectedModel.isAiCore
   val hasLiveMetrics by
     remember(viewModel, selectedModel.name, isLiveMetricsSupported) {
@@ -177,10 +193,46 @@ fun ChatPanel(
         }
       }
       .collectAsStateWithLifecycle(initialValue = false)
-  var showLiveMetrics by rememberSaveable { mutableStateOf(true) }
+  val showLiveMetrics = uiState.showLiveMetrics
+  // The live metrics toggle button is interactive only when metrics are available for the
+  // initialized model and no inference turn or session reset is active.
+  val isLiveMetricsToggleEnabled =
+    hasLiveMetrics &&
+      modelInitStatus is Model.InitializationStatus.Initialized &&
+      !uiState.isResettingSession &&
+      !uiState.inProgress
+
+  val audioConfigOnboardingDismissedInSession by
+    modelManagerViewModel.audioConfigOnboardingDismissedInSession.collectAsStateWithLifecycle()
+  val audioConfigOnboardingPromoViewed by
+    modelManagerViewModel.audioConfigOnboardingPromoViewed.collectAsStateWithLifecycle()
 
   if (isLiveMetricsFlagEnabled) {
-    LaunchedEffect(viewModel, selectedModel) { viewModel.observeLiveMetrics(selectedModel) }
+    LaunchedEffect(viewModel, task.id, selectedModel) {
+      viewModel.loadLiveMetricsVisibility(task.id)
+      viewModel.observeLiveMetrics(selectedModel)
+    }
+    LaunchedEffect(
+      isLiveMetricsToggleEnabled,
+      task.id,
+      audioConfigOnboardingDismissedInSession,
+      audioConfigOnboardingPromoViewed,
+    ) {
+      if (isLiveMetricsToggleEnabled) {
+        if (
+          !audioConfigOnboardingDismissedInSession &&
+            modelManagerViewModel.isTaskEligibleForAudioConfigOnboarding(task)
+        ) {
+          val promoViewed =
+            audioConfigOnboardingPromoViewed
+              ?: modelManagerViewModel.refreshAudioConfigOnboardingState()
+          if (!promoViewed) {
+            return@LaunchedEffect
+          }
+        }
+        viewModel.maybeShowLiveMetricsPrompt(task.id)
+      }
+    }
   }
   val scope = rememberCoroutineScope()
   val snackbarHostState = remember { SnackbarHostState() }
@@ -253,6 +305,29 @@ fun ChatPanel(
 
   // Stores the height of the viewport in pixels.
   var viewportHeightPx by remember { mutableIntStateOf(0) }
+
+  val lastAgentMessage =
+    (currentMessages.lastOrNull() as? ChatMessageText)?.takeIf { it.side == ChatSide.AGENT }
+  if (ttsController != null) {
+    TtsChatEffects(
+      controller = ttsController,
+      modelManagerViewModel = modelManagerViewModel,
+      selectedModelName = selectedModel.name,
+      isResettingSession = uiState.isResettingSession,
+      isStreaming = uiState.inProgress,
+      lastAgentMessageId = lastAgentMessage?.id,
+      lastAgentMessageContent = lastAgentMessage?.content,
+      capabilityName = task.id,
+    )
+  }
+  val ttsScrollState =
+    rememberChatTtsScrollState(
+      ttsController = ttsController,
+      listState = listState,
+      viewportHeightPx = viewportHeightPx,
+    )
+  val ttsViewportPositionModifier = ttsScrollState.viewportPositionModifier
+  val ttsUserScrollConnection = ttsScrollState.userScrollConnection
 
   // Stores if the list is at the scrollable area's bottom.
   //
@@ -356,7 +431,27 @@ fun ChatPanel(
     }
   }
 
-  Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+  // Dismiss the one-time discovery pill on any user touch or scroll completion across the screen
+  // without consuming the event (so tapping the pill itself still toggles live metrics).
+  val dismissPromptModifier =
+    if (uiState.showLiveMetricsPrompt && isLiveMetricsToggleEnabled) {
+      Modifier.pointerInput(viewModel) {
+        awaitEachGesture {
+          awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Final)
+          do {
+            val event = awaitPointerEvent(PointerEventPass.Final)
+          } while (event.changes.any { it.pressed })
+          viewModel.dismissLiveMetricsPrompt()
+        }
+      }
+    } else {
+      Modifier
+    }
+
+  Box(
+    modifier = Modifier.fillMaxSize().then(dismissPromptModifier),
+    contentAlignment = Alignment.BottomCenter,
+  ) {
     // Audio record animation.
     AnimatedVisibility(
       showAudioRecorder,
@@ -379,6 +474,14 @@ fun ChatPanel(
     Column(
       modifier = modifier.padding(innerPadding).consumeWindowInsets(innerPadding).imePadding()
     ) {
+      ChatTtsControlBanner(ttsController = ttsController)
+      val asrDictationViewModel = rememberChatAsrDictationViewModel(context)
+      val asrDictationUiState =
+        if (asrDictationViewModel != null) {
+          asrDictationViewModel.uiState.collectAsStateWithLifecycle().value
+        } else {
+          null
+        }
 
       Box(
         contentAlignment = Alignment.BottomCenter,
@@ -388,17 +491,19 @@ fun ChatPanel(
               // Update the viewport height when the size of the box changes.
               viewportHeightPx = it.height
             }
+            .then(ttsViewportPositionModifier),
       ) {
         val cdChatPanel = stringResource(R.string.cd_chat_panel)
         Column(
           modifier =
             Modifier.fillMaxSize()
               .nestedScroll(nestedScrollConnection)
+              .nestedScroll(ttsUserScrollConnection)
               .verticalScroll(state = listState)
               .semantics { contentDescription = cdChatPanel },
           verticalArrangement = Arrangement.Top,
         ) {
-          messages.forEachIndexed { index, message ->
+          ChatMessages(messages) { index, message ->
             val imageHistoryCurIndex = remember { mutableIntStateOf(0) }
             var hAlign: Alignment.Horizontal = Alignment.End
             var backgroundColor: Color = MaterialTheme.customColors.userBubbleBgColor
@@ -463,11 +568,37 @@ fun ChatPanel(
                 agentName = "$agentName on ${message.accelerator}"
               }
               if (!message.hideSenderLabel) {
+                if (message.side == ChatSide.AGENT && ttsController != null) {
+                  Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                  ) {
+                    MessageSender(
+                      message = message,
+                      agentName = agentName,
+                      imageHistoryCurIndex = imageHistoryCurIndex.intValue,
+                    )
+                    if (
+                      ttsController.isAvailable &&
+                        message is ChatMessageText &&
+                        message.content.isNotBlank()
+                    ) {
+                      TtsSpeakerButton(
+                        messageId = message.id,
+                        messageText = message.content,
+                        controller = ttsController,
+                        capabilityName = task.id,
+                      )
+                    }
+                  }
+                } else {
                   MessageSender(
                     message = message,
                     agentName = agentName,
                     imageHistoryCurIndex = imageHistoryCurIndex.intValue,
                   )
+                }
               }
 
               // Message body.
@@ -541,6 +672,7 @@ fun ChatPanel(
                               12.dp
                             },
                           onCopyClicked = copyToClipboard,
+                          ttsController = ttsController,
                         )
 
                       // Image
@@ -550,6 +682,14 @@ fun ChatPanel(
 
                       // Audio clip.
                       is ChatMessageAudioClip -> MessageBodyAudioClip(message = message)
+
+                      // File.
+                      is ChatMessageFile ->
+                        MessageBodyFile(
+                          message = message,
+                          onCopyClicked = copyToClipboard,
+                          onFileClicked = onFileSelected,
+                        )
 
                       // Benchmark result.
                       is ChatMessageBenchmarkResult -> MessageBodyBenchmark(message = message)
@@ -596,6 +736,18 @@ fun ChatPanel(
                             contentDescription = stringResource(R.string.copy),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
                             modifier = Modifier.size(18.dp),
+                          )
+                        }
+                        if (
+                          ttsController != null &&
+                            ttsController.isAvailable &&
+                            message.content.isNotBlank()
+                        ) {
+                          TtsSpeakerButton(
+                            messageId = message.id,
+                            messageText = message.content,
+                            controller = ttsController,
+                            capabilityName = task.id,
                           )
                         }
                       }
@@ -691,6 +843,11 @@ fun ChatPanel(
             Modifier.align(Alignment.TopCenter).padding(horizontal = 16.dp, vertical = 8.dp),
         )
 
+        DictationBottomFade(
+          visible = asrDictationUiState?.isDictating == true,
+          modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(28.dp),
+        )
+
         // "Scroll to bottom" button, only shown when the list is not at the bottom.
         Column(
           modifier =
@@ -708,6 +865,7 @@ fun ChatPanel(
 
       val modelNotSupportImageMsg = stringResource(R.string.model_not_support_image_message)
       val modelNotSupportAudioMsg = stringResource(R.string.model_not_support_audio_message)
+      val asrUnavailableMsg = stringResource(R.string.asr_error_unavailable)
       val imageLimitIgnoredMsg = stringResource(R.string.image_limit_ignored_message)
       val contextCompactionFailedMsg = stringResource(R.string.context_compaction_failed_message)
 
@@ -731,11 +889,21 @@ fun ChatPanel(
           status = contextCompactionStatus,
           initialDefaultToBehavior = isAutoCompactEnabled,
           onDefaultToBehaviorChanged = { defaultToBehavior ->
-            viewModel.setAutoCompact(task.id, defaultToBehavior)
+            viewModel.setAutoCompact(
+              taskId = task.id,
+              enabled = defaultToBehavior,
+              model = selectedModel,
+              source = AutoCompactionEnableSource.BANNER,
+            )
             modelManagerViewModel.updateConfigValuesUpdateTrigger()
           },
           onCompressClicked = { defaultToBehavior ->
-            viewModel.setAutoCompact(task.id, defaultToBehavior)
+            viewModel.setAutoCompact(
+              taskId = task.id,
+              enabled = defaultToBehavior,
+              model = selectedModel,
+              source = AutoCompactionEnableSource.BANNER,
+            )
             modelManagerViewModel.updateConfigValuesUpdateTrigger()
             viewModel.compactContext(
               model = selectedModel,
@@ -788,12 +956,15 @@ fun ChatPanel(
         textFieldPlaceHolderRes = task.textInputPlaceHolderRes,
         onValueChanged = { curMessage = it },
         onSendMessage = {
+          viewModel.dismissLiveMetricsPrompt()
+          ttsController?.stop()
           onSendMessage(selectedModel, it)
           curMessage = ""
           // Hide software keyboard.
           focusManager.clearFocus()
         },
         onOpenPromptTemplatesClicked = {
+          ttsController?.stop()
           onSendMessage(
             selectedModel,
             listOf(
@@ -824,7 +995,12 @@ fun ChatPanel(
         showDocumentPicker = task.id == BuiltInTaskId.LLM_CHAT,
         showLiveMetricsToggle = hasLiveMetrics,
         isLiveMetricsVisible = showLiveMetrics,
-        onToggleLiveMetrics = { showLiveMetrics = !showLiveMetrics },
+        showLiveMetricsPrompt = uiState.showLiveMetricsPrompt,
+        onDismissLiveMetricsPrompt = viewModel::dismissLiveMetricsPrompt,
+        onToggleLiveMetrics = {
+          viewModel.toggleLiveMetrics(taskId = task.id, model = selectedModel)
+        },
+        showTextFilePicker = showTextFilePicker && isTextFileInputEnabled,
         showStopButtonWhenInProgress = showStopButtonInInputWhenInProgress,
         isContextLimitReached = isContextLimitReached,
         onImageLimitExceeded = { showImageLimitBanner = true },
@@ -842,6 +1018,11 @@ fun ChatPanel(
         onPromoteTextInputHistoryItem = modelManagerViewModel::promoteTextInputHistoryItem,
         onDeleteTextInputHistoryItem = modelManagerViewModel::deleteTextInputHistory,
         onClearTextInputHistory = modelManagerViewModel::clearTextInputHistory,
+        asrDictationUiState = asrDictationUiState,
+        onStartAsrDictation = asrDictationViewModel?.let { vm -> vm::start },
+        onFinishAsrDictation = asrDictationViewModel?.let { vm -> vm::finish },
+        onCancelAsrDictation = asrDictationViewModel?.let { vm -> vm::cancel },
+        onAsrDictationError = { customErrorMessage = asrUnavailableMsg },
       )
     }
   }
@@ -870,6 +1051,32 @@ fun ChatPanel(
       onBenchmarkClicked = { message, warmUpIterations, benchmarkIterations ->
         onBenchmarkClicked(selectedModel, message, warmUpIterations, benchmarkIterations)
       },
+    )
+  }
+}
+
+/**
+ * Calls [content] for each of [messages] with its index, like `forEachIndexed`.
+ *
+ * The message UI is in its own composable lambda so that it compiles to its own method: inlined
+ * into [ChatPanel], it makes that method too large for JaCoCo to instrument for coverage.
+ */
+@Composable
+private fun ChatMessages(
+  messages: List<ChatMessage>,
+  content: @Composable (index: Int, message: ChatMessage) -> Unit,
+) {
+  messages.forEachIndexed { index, message -> content(index, message) }
+}
+
+@Composable
+private fun DictationBottomFade(visible: Boolean, modifier: Modifier = Modifier) {
+  AnimatedVisibility(visible = visible, enter = fadeIn(), exit = fadeOut(), modifier = modifier) {
+    val surfaceColor = MaterialTheme.colorScheme.surface
+    Box(
+      modifier =
+        Modifier.fillMaxSize()
+          .background(Brush.verticalGradient(colors = listOf(Color.Transparent, surfaceColor)))
     )
   }
 }

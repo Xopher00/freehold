@@ -71,12 +71,14 @@ import com.google.ai.edge.gallery.customtasks.common.CustomTaskDataForBuiltinTas
 import com.google.ai.edge.gallery.data.BuiltInTaskId
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.data.ModelDownloadStatusType
+import com.google.ai.edge.gallery.data.ModelSelectionTarget
 import com.google.ai.edge.gallery.data.Task
 import com.google.ai.edge.gallery.data.isLegacyTasks
 import com.google.ai.edge.gallery.ui.benchmark.BenchmarkScreen
 import com.google.ai.edge.gallery.ui.common.ErrorDialog
 import com.google.ai.edge.gallery.ui.common.LocalTestAllowlistDialog
 import com.google.ai.edge.gallery.ui.common.ModelPageAppBar
+import com.google.ai.edge.gallery.ui.common.OnAppBackgroundedEffect
 import com.google.ai.edge.gallery.ui.common.chat.ModelDownloadStatusInfoPanel
 import com.google.ai.edge.gallery.ui.common.tos.TosViewModel
 import com.google.ai.edge.gallery.ui.home.HomeScreen
@@ -84,6 +86,10 @@ import com.google.ai.edge.gallery.ui.modelmanager.GlobalModelManager
 import com.google.ai.edge.gallery.ui.modelmanager.MODEL_ALLOWLIST_TEST_FILE_PATH
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManager
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManagerViewModel
+import com.google.ai.edge.gallery.ui.modelmanager.SectionedModelSelectionScreen
+import com.google.ai.edge.gallery.ui.modelmanager.asModelSelectionHost
+import com.google.ai.edge.gallery.ui.modelmanager.isSavedModelSelectionComplete
+import com.google.ai.edge.gallery.ui.modelmanager.stopActiveVoicePreview
 import com.google.ai.edge.gallery.ui.notifications.NotificationsScreen
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -155,6 +161,8 @@ fun GalleryNavHost(
   var pickedTask by remember { mutableStateOf<Task?>(null) }
   var enableHomeScreenAnimation by remember { mutableStateOf(false) }
   var enableModelListAnimation by remember { mutableStateOf(true) }
+  // The section the model selection screen expands when a task sends the user back to it.
+  var modelSelectionTargetToExpand by remember { mutableStateOf<ModelSelectionTarget?>(null) }
   val modelManagerUiState by modelManagerViewModel.uiState.collectAsState()
 
   // Track whether app is in foreground.
@@ -179,6 +187,9 @@ fun GalleryNavHost(
 
     onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
   }
+
+  // Don't keep playing a voice preview after the app leaves the foreground.
+  OnAppBackgroundedEffect { modelManagerViewModel.stopActiveVoicePreview() }
 
   NavHost(
     navController = navController,
@@ -251,22 +262,44 @@ fun GalleryNavHost(
       },
     ) {
       pickedTask?.let {
-        ModelManager(
-          viewModel = modelManagerViewModel,
-          task = it,
-          enableAnimation = enableModelListAnimation,
-          onModelClicked = { model ->
-            modelManagerViewModel.selectModel(model)
-            navController.navigate("$ROUTE_MODEL/${it.id}/${model.name}")
-          },
-          onBenchmarkClicked = { model ->
-            navController.navigate("$ROUTE_BENCHMARK/${model.name}")
-          },
-          navigateUp = {
-            enableHomeScreenAnimation = false
-            navController.navigateUp()
-          },
-        )
+        val selectionConfig =
+          modelManagerViewModel.getCustomTaskByTaskId(it.id)?.modelSelectionConfig
+        if (selectionConfig != null) {
+          // Tasks that need several models picked together get the sectioned selection screen.
+          SectionedModelSelectionScreen(
+            task = it,
+            config = selectionConfig,
+            modelManagerViewModel = modelManagerViewModel,
+            enableAnimation = enableModelListAnimation,
+            navigateUp = {
+              enableHomeScreenAnimation = false
+              navController.navigateUp()
+            },
+            onLaunch = { model ->
+              modelManagerViewModel.selectModel(model)
+              navController.navigate("$ROUTE_MODEL/${it.id}/${model.name}")
+            },
+            expandTarget = modelSelectionTargetToExpand,
+            onExpandTargetHandled = { modelSelectionTargetToExpand = null },
+          )
+        } else {
+          ModelManager(
+            viewModel = modelManagerViewModel,
+            task = it,
+            enableAnimation = enableModelListAnimation,
+            onModelClicked = { model ->
+              modelManagerViewModel.selectModel(model)
+              navController.navigate("$ROUTE_MODEL/${it.id}/${model.name}")
+            },
+            onBenchmarkClicked = { model ->
+              navController.navigate("$ROUTE_BENCHMARK/${model.name}")
+            },
+            navigateUp = {
+              enableHomeScreenAnimation = false
+              navController.navigateUp()
+            },
+          )
+        }
       }
     }
 
@@ -304,88 +337,137 @@ fun GalleryNavHost(
       val context = LocalContext.current
 
       modelManagerViewModel.getModelByName(name = modelName)?.let { initialModel ->
-        LaunchedEffect(modelName) { modelManagerViewModel.selectModel(initialModel) }
-
         val customTask = modelManagerViewModel.getCustomTaskByTaskId(id = taskId)
-        if (customTask != null) {
-          if (isLegacyTasks(customTask.task.id)) {
-            customTask.MainScreen(
-              data =
-                CustomTaskDataForBuiltinTask(
-                  modelManagerViewModel = modelManagerViewModel,
-                  onNavUp = {
-                    enableModelListAnimation = false
-                    navController.navigateUp()
-                  },
-                  initialQuery = queryParam,
-                  sessionId = sessionId,
-                  autoResumeSession = autoResume,
+        // A task with a model selection screen only starts with a complete saved selection. Entry
+        // points that skip the selection screen (the global model manager, deep links, download
+        // notifications and STARTUP_SCREEN) are redirected to it otherwise. This is checked once on
+        // entry, so later status changes don't pull the user out of a running task.
+        val needsModelSelection =
+          remember(backStackEntry) {
+            val selectionConfig = customTask?.modelSelectionConfig
+            customTask != null &&
+              selectionConfig != null &&
+              !modelManagerViewModel
+                .asModelSelectionHost()
+                .isSavedModelSelectionComplete(
+                  task = customTask.task,
+                  config = selectionConfig,
+                  mainModel = initialModel,
                 )
-            )
-          } else {
-            var disableAppBarControls by remember { mutableStateOf(false) }
-            var hideTopBar by remember { mutableStateOf(false) }
-            var customNavigateUpCallback by remember { mutableStateOf<(() -> Unit)?>(null) }
-            var customPromptProvider by remember { mutableStateOf<(() -> String)?>(null) }
-            var customOnPromptChanged by remember { mutableStateOf<((String) -> Unit)?>(null) }
-            var customHistoryClickHandler by remember { mutableStateOf<(() -> Unit)?>(null) }
-            var customDefaultPromptProvider by remember { mutableStateOf<(() -> String)?>(null) }
-            CustomTaskScreen(
-              task = customTask.task,
-              initialModel = initialModel,
-              modelManagerViewModel = modelManagerViewModel,
-              disableAppBarControls = disableAppBarControls,
-              hideTopBar = hideTopBar,
-              useThemeColor = customTask.task.useThemeColor,
-              onNavigateUp = {
-                if (customNavigateUpCallback != null) {
-                  customNavigateUpCallback?.invoke()
-                } else {
-                  enableModelListAnimation = false
-                  navController.navigateUp()
+          }
+        if (needsModelSelection && customTask != null) {
+          LaunchedEffect(backStackEntry) {
+            Log.d(TAG, "Incomplete model selection for '${customTask.task.id}'. Opening selection.")
+            pickedTask = customTask.task
+            enableModelListAnimation = true
+            navController.navigate(ROUTE_MODEL_LIST) {
+              popUpTo(backStackEntry.destination.id) { inclusive = true }
+            }
+          }
+        } else {
+          LaunchedEffect(modelName) { modelManagerViewModel.selectModel(initialModel) }
 
-                  if (!customTask.keepModelAlive) {
-                    // clean up all models.
-                    for (curModel in customTask.task.models) {
-                      val instanceToCleanUp = curModel.instance
-                      modelManagerViewModel.viewModelScope.launch(Dispatchers.Default) {
-                        modelManagerViewModel.cleanupModel(
-                          context = context,
-                          task = customTask.task,
-                          model = curModel,
-                          instanceToCleanUp = instanceToCleanUp,
-                        )
-                      }
+          if (customTask != null) {
+            if (isLegacyTasks(customTask.task.id)) {
+              customTask.MainScreen(
+                data =
+                  CustomTaskDataForBuiltinTask(
+                    modelManagerViewModel = modelManagerViewModel,
+                    onNavUp = {
+                      enableModelListAnimation = false
+                      navController.navigateUp()
+                    },
+                    initialQuery = queryParam,
+                    sessionId = sessionId,
+                    autoResumeSession = autoResume,
+                  )
+              )
+            } else {
+              var disableAppBarControls by remember { mutableStateOf(false) }
+              var disableAppBarActions by remember { mutableStateOf(false) }
+              var hideTopBar by remember { mutableStateOf(false) }
+              var customNavigateUpCallback by remember { mutableStateOf<(() -> Unit)?>(null) }
+              var customPromptProvider by remember { mutableStateOf<(() -> String)?>(null) }
+              var customOnPromptChanged by remember { mutableStateOf<((String) -> Unit)?>(null) }
+              var customHistoryClickHandler by remember { mutableStateOf<(() -> Unit)?>(null) }
+              var customDefaultPromptProvider by remember { mutableStateOf<(() -> String)?>(null) }
+              fun cleanUpModelsOnLeave() {
+                if (!customTask.keepModelAlive) {
+                  // clean up all models.
+                  for (curModel in customTask.task.models) {
+                    val instanceToCleanUp = curModel.instance
+                    modelManagerViewModel.viewModelScope.launch(Dispatchers.Default) {
+                      modelManagerViewModel.cleanupModel(
+                        context = context,
+                        task = customTask.task,
+                        model = curModel,
+                        instanceToCleanUp = instanceToCleanUp,
+                      )
                     }
                   }
                 }
-              },
-              allowEditingSystemPrompt = customPromptProvider != null,
-              curSystemPrompt =
-                customPromptProvider?.invoke() ?: customTask.task.defaultSystemPrompt,
-              defaultSystemPrompt =
-                customDefaultPromptProvider?.invoke() ?: customTask.task.defaultSystemPrompt,
-              onSystemPromptChanged = { newPrompt -> customOnPromptChanged?.invoke(newPrompt) },
-              onHistoryClicked = customHistoryClickHandler,
-            ) { bottomPadding, selectedModel ->
-              customTask.MainScreen(
-                data =
-                  CustomTaskData(
-                    modelManagerViewModel = modelManagerViewModel,
-                    selectedModel = selectedModel,
-                    bottomPadding = bottomPadding,
-                    setAppBarControlsDisabled = { disableAppBarControls = it },
-                    setTopBarVisible = { hideTopBar = !it },
-                    sessionId = sessionId,
-                    setCustomNavigateUpCallback = { customNavigateUpCallback = it },
-                    setSystemPromptProvider = { provider, onPromptChanged ->
-                      customPromptProvider = provider
-                      customOnPromptChanged = onPromptChanged
-                    },
-                    setHistoryClickHandler = { customHistoryClickHandler = it },
-                    setDefaultSystemPromptProvider = { customDefaultPromptProvider = it },
-                  )
-              )
+              }
+              CustomTaskScreen(
+                task = customTask.task,
+                initialModel = initialModel,
+                modelManagerViewModel = modelManagerViewModel,
+                disableAppBarControls = disableAppBarControls,
+                disableAppBarActions = disableAppBarActions,
+                hideTopBar = hideTopBar,
+                useThemeColor = customTask.task.useThemeColor,
+                onNavigateUp = {
+                  if (customNavigateUpCallback != null) {
+                    customNavigateUpCallback?.invoke()
+                  } else {
+                    enableModelListAnimation = false
+                    navController.navigateUp()
+                    cleanUpModelsOnLeave()
+                  }
+                },
+                allowEditingSystemPrompt = customPromptProvider != null,
+                curSystemPrompt =
+                  customPromptProvider?.invoke() ?: customTask.task.defaultSystemPrompt,
+                defaultSystemPrompt =
+                  customDefaultPromptProvider?.invoke() ?: customTask.task.defaultSystemPrompt,
+                onSystemPromptChanged = { newPrompt -> customOnPromptChanged?.invoke(newPrompt) },
+                onHistoryClicked = customHistoryClickHandler,
+              ) { bottomPadding, selectedModel ->
+                customTask.MainScreen(
+                  data =
+                    CustomTaskData(
+                      modelManagerViewModel = modelManagerViewModel,
+                      selectedModel = selectedModel,
+                      bottomPadding = bottomPadding,
+                      setAppBarControlsDisabled = { disableAppBarControls = it },
+                      setAppBarActionsDisabled = { disableAppBarActions = it },
+                      setTopBarVisible = { hideTopBar = !it },
+                      sessionId = sessionId,
+                      setCustomNavigateUpCallback = { customNavigateUpCallback = it },
+                      setSystemPromptProvider = { provider, onPromptChanged ->
+                        customPromptProvider = provider
+                        customOnPromptChanged = onPromptChanged
+                      },
+                      setHistoryClickHandler = { customHistoryClickHandler = it },
+                      setDefaultSystemPromptProvider = { customDefaultPromptProvider = it },
+                      navigateToModelSelection = { target ->
+                        if (customTask.modelSelectionConfig != null) {
+                          Log.d(TAG, "Opening the model selection of '${customTask.task.id}'")
+                          pickedTask = customTask.task
+                          modelSelectionTargetToExpand = target
+                          enableModelListAnimation = false
+                          // Return to the selection screen the task was launched from, keeping
+                          // its selection, or open it if the task was opened from elsewhere.
+                          if (!navController.popBackStack(ROUTE_MODEL_LIST, inclusive = false)) {
+                            navController.navigate(ROUTE_MODEL_LIST) {
+                              popUpTo(backStackEntry.destination.id) { inclusive = true }
+                            }
+                          }
+                          cleanUpModelsOnLeave()
+                        }
+                      },
+                    )
+                )
+              }
             }
           }
         }
@@ -434,6 +516,7 @@ fun GalleryNavHost(
         viewModel = modelManagerViewModel,
         tosViewModel = tosViewModel,
         initialImportUrl = importUrl,
+        supplementaryModelsViewModel = hiltViewModel(),
         navigateUp = {
           enableHomeScreenAnimation = false
           navController.navigateUp()
@@ -557,6 +640,7 @@ private fun CustomTaskScreen(
   initialModel: Model,
   modelManagerViewModel: ModelManagerViewModel,
   disableAppBarControls: Boolean,
+  disableAppBarActions: Boolean,
   hideTopBar: Boolean,
   useThemeColor: Boolean,
   onNavigateUp: () -> Unit,
@@ -624,6 +708,7 @@ private fun CustomTaskScreen(
           modelManagerViewModel = modelManagerViewModel,
           inProgress = disableAppBarControls,
           modelPreparing = disableAppBarControls,
+          actionsDisabled = disableAppBarActions,
           shouldShowHistoryButton = onHistoryClicked != null,
           onHistoryClicked = { onHistoryClicked?.invoke() },
           useThemeColor = useThemeColor,

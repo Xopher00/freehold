@@ -130,6 +130,12 @@ data class Model(
   /** LLM-specific parameters and capability flags. */
   val llmProfile: LlmProfile? = null,
 
+  /** TTS-specific parameters for supplementary Text-to-Speech models. */
+  val ttsProfile: TtsProfile? = null,
+
+  /** ASR-specific parameters for supplementary speech recognition models. */
+  val asrProfile: AsrProfile? = null,
+
   /**
    * The model category declared by the allowlist, or `null` to derive it from the attached profile.
    * See [modelType].
@@ -177,6 +183,7 @@ data class Model(
     get() =
       declaredModelType
         ?: when {
+          ttsProfile != null -> ModelType.TTS
           else -> ModelType.TASK
         }
 
@@ -184,6 +191,9 @@ data class Model(
     get() = modelType != ModelType.TASK
 
   init {
+    require(llmProfile == null || ttsProfile == null) {
+      "Model '$name' cannot have both llmProfile and ttsProfile."
+    }
     normalizedName = NORMALIZE_NAME_REGEX.replace(name, "_")
   }
 

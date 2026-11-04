@@ -41,6 +41,7 @@ import com.google.ai.edge.litertlm.Role
 import com.google.ai.edge.litertlm.ToolProvider
 import com.google.mlkit.genai.common.DownloadStatus
 import com.google.mlkit.genai.common.FeatureStatus
+import com.google.mlkit.genai.prompt.GenerateContentRequest
 import com.google.mlkit.genai.prompt.Generation
 import com.google.mlkit.genai.prompt.GenerativeModel
 import com.google.mlkit.genai.prompt.ImagePart
@@ -48,10 +49,13 @@ import com.google.mlkit.genai.prompt.ModelPreference
 import com.google.mlkit.genai.prompt.ModelReleaseStage
 import com.google.mlkit.genai.prompt.TextPart
 import com.google.mlkit.genai.prompt.generateContentRequest
+import com.google.mlkit.genai.prompt.generateTypedContentRequest
 import com.google.mlkit.genai.prompt.generationConfig
 import com.google.mlkit.genai.prompt.modelConfig
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.reflect.KClass
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -113,6 +117,8 @@ object AICoreModelHelper : LlmModelHelper {
     val sysText = systemInstruction?.toString()?.takeIf { it.isNotBlank() }
 
     initJobs.remove(model.name)?.cancel()
+    val closed = AtomicBoolean(false)
+    val assignedToModelInstance = AtomicBoolean(false)
     val job = scope.launch {
       try {
         val status = generativeModel.checkStatus()
@@ -120,6 +126,7 @@ object AICoreModelHelper : LlmModelHelper {
           FeatureStatus.AVAILABLE -> {
             generativeModel.warmup()
             updateTokenLimit(model, generativeModel)
+            assignedToModelInstance.set(true)
             model.instance =
               createModelInstance(
                 generativeModel = generativeModel,
@@ -144,6 +151,7 @@ object AICoreModelHelper : LlmModelHelper {
                 is DownloadStatus.DownloadCompleted -> {
                   generativeModel.warmup()
                   updateTokenLimit(model, generativeModel)
+                  assignedToModelInstance.set(true)
                   model.instance =
                     createModelInstance(
                       generativeModel = generativeModel,
@@ -168,10 +176,19 @@ object AICoreModelHelper : LlmModelHelper {
       } catch (e: Exception) {
         Log.e(TAG, "Initialization failed", e)
         onDone(cleanUpMediapipeTaskErrorMessage(e.message ?: "Unknown error"))
+      } finally {
+        if (!assignedToModelInstance.get() && closed.compareAndSet(false, true)) {
+          generativeModel.close()
+        }
       }
     }
     initJobs[model.name] = job
-    job.invokeOnCompletion { initJobs.remove(model.name, job) }
+    job.invokeOnCompletion {
+      initJobs.remove(model.name, job)
+      if (!assignedToModelInstance.get() && closed.compareAndSet(false, true)) {
+        generativeModel.close()
+      }
+    }
   }
 
   private fun createModelInstance(
@@ -202,6 +219,7 @@ object AICoreModelHelper : LlmModelHelper {
     val scope = coroutineScope ?: CoroutineScope(defaultDispatcher + SupervisorJob())
 
     downloadJobs.remove(model.name)?.cancel()
+    val closed = AtomicBoolean(false)
     val job = scope.launch {
       try {
         val status = generativeModel.checkStatus()
@@ -243,10 +261,19 @@ object AICoreModelHelper : LlmModelHelper {
       } catch (e: Exception) {
         Log.e(TAG, "Download failed", e)
         onError(cleanUpMediapipeTaskErrorMessage(e.message ?: "Unknown error"))
+      } finally {
+        if (closed.compareAndSet(false, true)) {
+          generativeModel.close()
+        }
       }
     }
     downloadJobs[model.name] = job
-    job.invokeOnCompletion { downloadJobs.remove(model.name, job) }
+    job.invokeOnCompletion {
+      downloadJobs.remove(model.name, job)
+      if (closed.compareAndSet(false, true)) {
+        generativeModel.close()
+      }
+    }
   }
 
   suspend fun isModelDownloaded(model: Model): Boolean {
@@ -257,6 +284,8 @@ object AICoreModelHelper : LlmModelHelper {
     } catch (e: Exception) {
       Log.e(TAG, "Failed to check AICore model status", e)
       false
+    } finally {
+      generativeModel.close()
     }
   }
 
@@ -505,6 +534,22 @@ object AICoreModelHelper : LlmModelHelper {
           }
         }
 
+      if (!generableClassName.isNullOrBlank()) {
+        val generableKClass =
+          Class.forName(generableClassName, true, Thread.currentThread().contextClassLoader).kotlin
+        val typedResponse = generateTypedContent(instance.generativeModel, request, generableKClass)
+        val jsonOutput =
+          (typedResponse as? AICoreGenerableResponse)?.toJsonString()
+            ?: typedResponse?.toString().orEmpty()
+        if (!isEphemeral) {
+          instance.chatHistory.add(AICoreChatMessage(isUser = true, text = input))
+          instance.chatHistory.add(AICoreChatMessage(isUser = false, text = jsonOutput))
+        }
+        hasDeliveredDone = true
+        resultListener(jsonOutput, true, null)
+        return
+      }
+
       val flow = instance.generativeModel.generateContentStream(request)
 
       var fullResponse = ""
@@ -541,6 +586,17 @@ object AICoreModelHelper : LlmModelHelper {
       onError("Error: ${e.message}")
     }
   }
+
+  private suspend fun <T : Any> generateTypedContent(
+    generativeModel: GenerativeModel,
+    request: GenerateContentRequest,
+    generableKClass: KClass<T>,
+  ): T? =
+    generativeModel
+      .generateContent(generateTypedContentRequest(request, generableKClass))
+      .candidates
+      .firstOrNull()
+      ?.response
 
   // Update the token limit of the model based on the value from AICore.
   private suspend fun updateTokenLimit(model: Model, generativeModel: GenerativeModel) {

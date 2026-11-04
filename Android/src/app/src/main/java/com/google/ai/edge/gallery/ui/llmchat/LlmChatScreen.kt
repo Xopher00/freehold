@@ -51,6 +51,7 @@ import com.google.ai.edge.gallery.data.ModelCapability
 import com.google.ai.edge.gallery.data.Task
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessage
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageAudioClip
+import com.google.ai.edge.gallery.ui.common.chat.ChatMessageFile
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageImage
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageMapper
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageText
@@ -88,6 +89,7 @@ fun LlmChatScreen(
   sendMessageTrigger: SendMessageTrigger? = null,
   showImagePicker: Boolean = false,
   showAudioPicker: Boolean = false,
+  showTextFilePicker: Boolean = false,
   getActiveSkills: () -> List<String> = { emptyList() },
   skillCount: Int = 0,
   mcpCount: Int = 0,
@@ -118,6 +120,7 @@ fun LlmChatScreen(
     sendMessageTrigger = sendMessageTrigger,
     showImagePicker = showImagePicker,
     showAudioPicker = showAudioPicker,
+    showTextFilePicker = showTextFilePicker,
     getActiveSkills = getActiveSkills,
     sessionId = sessionId,
     autoResumeSession = autoResumeSession,
@@ -247,6 +250,7 @@ fun ChatViewWrapper(
   sendMessageTrigger: SendMessageTrigger? = null,
   showImagePicker: Boolean = false,
   showAudioPicker: Boolean = false,
+  showTextFilePicker: Boolean = false,
   getActiveSkills: () -> List<String> = { emptyList() },
   skillCount: Int = 0,
   mcpCount: Int = 0,
@@ -276,6 +280,7 @@ fun ChatViewWrapper(
       var text = ""
       val images: MutableList<Bitmap> = mutableListOf()
       val audioMessages: MutableList<ChatMessageAudioClip> = mutableListOf()
+      val fileMessages: MutableList<ChatMessageFile> = mutableListOf()
       var chatMessageText: ChatMessageText? = null
       for (message in messages) {
         if (message is ChatMessageText) {
@@ -285,9 +290,15 @@ fun ChatViewWrapper(
           images.addAll(message.bitmaps)
         } else if (message is ChatMessageAudioClip) {
           audioMessages.add(message)
+        } else if (message is ChatMessageFile) {
+          fileMessages.add(message)
         }
       }
-      if ((text.isNotEmpty() && chatMessageText != null) || audioMessages.isNotEmpty()) {
+      if (
+        (text.isNotEmpty() && chatMessageText != null) ||
+          audioMessages.isNotEmpty() ||
+          fileMessages.isNotEmpty()
+      ) {
         if (text.isNotEmpty()) {
           modelManagerViewModel.addTextInputHistory(text)
         }
@@ -296,6 +307,7 @@ fun ChatViewWrapper(
           input = text,
           images = images,
           audioMessages = audioMessages,
+          files = fileMessages,
           onFirstToken = onFirstToken,
           onDone = { onGenerateResponseDone(model) },
           onError = { errorMessage ->
@@ -411,5 +423,6 @@ fun ChatViewWrapper(
     showAudioPicker = showAudioPicker,
     sessionId = sessionId,
     autoResumeSession = autoResumeSession,
+    showTextFilePicker = showTextFilePicker,
   )
 }

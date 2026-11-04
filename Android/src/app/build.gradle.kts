@@ -39,8 +39,8 @@ android {
     applicationId = "io.github.xopher00.freehold"
     minSdk = 31
     targetSdk = 37
-    versionCode = 46
-    versionName = "1.0.20"
+    versionCode = 52
+    versionName = "1.0.23"
 
     // Needed for HuggingFace auth workflows.
     // Use the scheme of the "Redirect URLs" in HuggingFace app.
@@ -168,9 +168,6 @@ dependencies {
   implementation(libs.litertlm)
   implementation(libs.commonmark)
   implementation(libs.richtext)
-  implementation(libs.tflite)
-  implementation(libs.tflite.gpu)
-  implementation(libs.tflite.support)
   implementation(libs.camerax.core)
   implementation(libs.camerax.camera2)
   implementation(libs.camerax.lifecycle)
@@ -235,6 +232,15 @@ dependencies {
   implementation(libs.androidx.media3.transformer)
   implementation(libs.androidx.media3.ui)
   implementation(libs.coil.compose)
+  implementation(libs.androidx.xr.projected)
+  implementation(libs.mlkit.genai.common)
+  implementation(libs.mlkit.genai.speech.recognition)
+  implementation(libs.mlkit.genai.text.to.speech)
+  implementation(libs.mlkit.genai.schema)
+  ksp(libs.mlkit.genai.schema.compiler)
+  implementation(libs.tasks.audio)
+  implementation(libs.androidx.pdf.core)
+  implementation(libs.androidx.pdf.document.service)
 }
 
 configurations.all { resolutionStrategy.force("org.jetbrains.kotlin:kotlin-metadata-jvm:2.4.0") }
