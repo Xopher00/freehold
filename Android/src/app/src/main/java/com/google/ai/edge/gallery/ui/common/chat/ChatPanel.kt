@@ -1021,6 +1021,7 @@ fun ChatPanel(
         asrDictationUiState = asrDictationUiState,
         onStartAsrDictation = asrDictationViewModel?.let { vm -> vm::start },
         onFinishAsrDictation = asrDictationViewModel?.let { vm -> vm::finish },
+        onSendAsrDictation = asrDictationViewModel?.let { vm -> vm::finishAndSend },
         onCancelAsrDictation = asrDictationViewModel?.let { vm -> vm::cancel },
         onAsrDictationError = { customErrorMessage = asrUnavailableMsg },
       )

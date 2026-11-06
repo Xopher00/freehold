@@ -95,6 +95,8 @@ fun ModelPageAppBar(
   modelPreparing: Boolean,
   modifier: Modifier = Modifier,
   hideModelSelector: Boolean = false,
+  // Hides the model config button so users can't change model configs or the system prompt.
+  hideConfigButton: Boolean = false,
   useThemeColor: Boolean = false,
   onConfigChanged: (oldConfigValues: Map<String, Any>, newConfigValues: Map<String, Any>) -> Unit =
     { _, _ ->
@@ -160,7 +162,11 @@ fun ModelPageAppBar(
           if (icon != null) {
             Icon(icon, tint = tintColor, modifier = Modifier.size(24.dp), contentDescription = null)
           }
-          Text(task.label, style = MaterialTheme.typography.titleMedium, color = tintColor)
+          Text(
+            task.label,
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+          )
         }
 
         // Model chips pager.
@@ -193,7 +199,8 @@ fun ModelPageAppBar(
       val downloadSucceeded = curDownloadStatus?.status == ModelDownloadStatusType.SUCCEEDED
       // XR Language Teacher has its own language and teacher settings instead of Model Config.
       val showConfigButton =
-        model.configs.isNotEmpty() &&
+        !hideConfigButton &&
+          model.configs.isNotEmpty() &&
           downloadSucceeded &&
           task.id != BuiltInTaskId.LLM_XR_LANGUAGE_TEACHER
       Box(modifier = Modifier.size(42.dp), contentAlignment = Alignment.Center) {
@@ -267,7 +274,8 @@ fun ModelPageAppBar(
   val downloadSucceededForOnboarding =
     curDownloadStatus?.status == ModelDownloadStatusType.SUCCEEDED
   val configButtonReadyForOnboarding =
-    model.configs.isNotEmpty() &&
+    !hideConfigButton &&
+      model.configs.isNotEmpty() &&
       downloadSucceededForOnboarding &&
       task.id != BuiltInTaskId.LLM_XR_LANGUAGE_TEACHER &&
       !isModelInitializing &&
