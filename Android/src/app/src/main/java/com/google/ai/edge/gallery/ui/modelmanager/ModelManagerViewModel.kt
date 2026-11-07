@@ -1091,7 +1091,7 @@ constructor(
    * Downloads [model] for [task] (see [downloadModel]), once the user agrees to use mobile data if
    * the device is on it, and then calls [onStarted]. If the user doesn't agree, nothing starts, the
    * download is no longer recorded as started by the user (see [forgetUserStartedDownload]), and
-   * [onCancelled] is called.
+   * [onCancelled] is called. [includeExtraDataFiles] is passed on to [downloadModel].
    */
   @MainThread
   open fun downloadModelAfterMobileDataCheck(
@@ -1099,11 +1099,13 @@ constructor(
     model: Model,
     onStarted: () -> Unit = {},
     onCancelled: () -> Unit = {},
+    includeExtraDataFiles: Boolean = isDownloadOptionalComponentsEnabled(model.name),
   ) {
+    val downloads = mutableListOf<Pair<Task?, Model>>(task to model)
     confirmMobileDataDownload(
-      downloadBytes = mobileDataDownloadBytes(listOf(task to model)),
+      downloadBytes = mobileDataDownloadBytes(downloads),
       onConfirmed = {
-        downloadModel(task = task, model = model)
+        downloadModel(task = task, model = model, includeExtraDataFiles = includeExtraDataFiles)
         onStarted()
       },
       onCancelled = {
