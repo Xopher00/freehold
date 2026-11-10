@@ -17,12 +17,15 @@
 package com.google.ai.edge.gallery.ui.theme
 
 import androidx.compose.material3.Typography
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
 val baseline = Typography()
 
 val AppTypography = Typography()
+
+val appFontFamily = FontFamily.Default
 
 val titleMediumNarrow = baseline.titleMedium.copy(letterSpacing = 0.0.sp)
 
